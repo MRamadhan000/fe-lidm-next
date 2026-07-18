@@ -1,9 +1,8 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { motion } from 'motion/react';
-import { ArrowLeft, Loader2, PlayCircle, Target, Trophy, User } from 'lucide-react';
+import { ArrowLeft, Loader2, PlayCircle, Target, Trophy, User, Upload, CheckCircle2, XCircle, RotateCcw } from 'lucide-react';
 
 interface StudentAnswer {
   id: string;
@@ -128,6 +127,91 @@ interface StudentDashboardDetailResponse {
   levels: DetailLevel[];
 }
 
+// ==== Bentuk response dari endpoint /student-assessments/start ====
+interface StartAnswerResponse {
+  id: string; // ini yang jadi studentQuestionItemId
+  studentClassLevel: {
+    id: string;
+    isLocked: boolean;
+    unlockedAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+  questionItem: {
+    id: string;
+    type: string;
+    name: string;
+    image: string;
+    price: number;
+    quantity: number;
+    weight: number;
+    orderNumber: number;
+    moneyNominals: unknown;
+    createdAt: string;
+    updatedAt: string;
+  };
+  student: {
+    id: string;
+    username: string;
+    email: string;
+    fullName: string;
+    role: string;
+  };
+  status: string;
+  score: number;
+  startedAt: string;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ==== Bentuk response dari endpoint .../submit ====
+interface SubmitAnswerResponse {
+  id: string;
+  studentQuestionItem: {
+    id: string;
+    status: string;
+    score: number;
+    startedAt: string;
+    completedAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+  questionItem: {
+    id: string;
+    type: string;
+    name: string;
+    image: string;
+    price: number;
+    quantity: number;
+    weight: number;
+    orderNumber: number;
+    moneyNominals: unknown;
+    createdAt: string;
+    updatedAt: string;
+  };
+  uploadedImage: string;
+  ssim: number;
+  mse: number;
+  isCorrect: boolean;
+  score: number;
+  answeredAt: string;
+}
+
+// Status pengerjaan tiap item di sisi UI (client-side state machine)
+type ItemUiStatus = 'idle' | 'starting' | 'started' | 'submitting' | 'submitted';
+
+interface ItemProgressState {
+  studentQuestionItemId: string | null;
+  status: ItemUiStatus;
+  selectedFile: File | null;
+  previewUrl: string | null;
+  lastResult: SubmitAnswerResponse | null;
+  error: string | null;
+}
+
+const API_BASE = 'http://localhost:3000';
+
 export default function DetailKelasSiswaPageCompact() {
   const params = useParams<{ slug: string | string[] }>();
   const slug = Array.isArray(params.slug) ? params.slug[0] : params.slug;
@@ -136,6 +220,10 @@ export default function DetailKelasSiswaPageCompact() {
   const [data, setData] = useState<StudentDashboardDetailResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [startedQuestionIds, setStartedQuestionIds] = useState<string[]>([]);
+  const [studentId, setStudentId] = useState<string | null>(null);
+
+  // key = questionItemId (item.id) -> progress state item tersebut
+  const [itemProgress, setItemProgress] = useState<Record<string, ItemProgressState>>({});
 
   useEffect(() => {
     if (!slug) return;
@@ -147,10 +235,11 @@ export default function DetailKelasSiswaPageCompact() {
     }
 
     const { id: userId } = JSON.parse(session) as { id: string };
+    setStudentId(userId);
 
     const fetchData = async () => {
       try {
-        const res = await fetch(`http://localhost:3000/student-assessments/history?userId=${userId}&classId=${slug}`);
+        const res = await fetch(`${API_BASE}/student-assessments/history?userId=${userId}&classId=${slug}`);
         if (!res.ok) throw new Error('Gagal mengambil detail kelas siswa');
         const result = (await res.json()) as StudentDashboardDetailResponse;
         setData(result);
@@ -165,7 +254,7 @@ export default function DetailKelasSiswaPageCompact() {
   }, [slug, router]);
 
   if (!slug) return <div className="text-center p-6 text-sm">ID kelas tidak valid.</div>;
-  
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -173,7 +262,7 @@ export default function DetailKelasSiswaPageCompact() {
       </div>
     );
   }
-  
+
   if (!data) return <div className="text-center p-6 text-sm">Data kelas tidak ditemukan.</div>;
 
   const levels = [...data.levels].sort((left, right) => left.level.orderNumber - right.level.orderNumber);
@@ -182,10 +271,134 @@ export default function DetailKelasSiswaPageCompact() {
     setStartedQuestionIds((prev) => (prev.includes(questionId) ? prev : [...prev, questionId]));
   };
 
+  const getItemProgress = (itemId: string): ItemProgressState => {
+    return (
+      itemProgress[itemId] ?? {
+        studentQuestionItemId: null,
+        status: 'idle',
+        selectedFile: null,
+        previewUrl: null,
+        lastResult: null,
+        error: null,
+      }
+    );
+  };
+
+  const updateItemProgress = (itemId: string, patch: Partial<ItemProgressState>) => {
+    setItemProgress((prev) => ({
+      ...prev,
+      [itemId]: { ...getItemProgress(itemId), ...prev[itemId], ...patch },
+    }));
+  };
+
+  // === Step 1: Mulai pengerjaan item (POST /student-assessments/start) ===
+  const handleStartItem = async (lvl: DetailLevel, item: DetailItem) => {
+    if (!studentId) return;
+
+    updateItemProgress(item.id, { status: 'starting', error: null });
+
+    try {
+      const res = await fetch(`${API_BASE}/student-assessments/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          studentId,
+          classLevelId: lvl.classLevelId,
+          questionItemId: item.id,
+        }),
+      });
+
+      if (!res.ok) throw new Error('Gagal memulai pengerjaan item');
+
+      const result = (await res.json()) as StartAnswerResponse;
+
+      // simpan studentQuestionItemId (result.id) untuk dipakai saat submit
+      updateItemProgress(item.id, {
+        studentQuestionItemId: result.id,
+        status: 'started',
+        error: null,
+      });
+    } catch (error) {
+      console.error('Gagal start item:', error);
+      updateItemProgress(item.id, {
+        status: 'idle',
+        error: 'Gagal memulai pengerjaan. Coba lagi.',
+      });
+    }
+  };
+
+  // === Pilih file foto jawaban ===
+  const handleFileSelect = (item: DetailItem, file: File | null) => {
+    const prev = getItemProgress(item.id);
+    if (prev.previewUrl) URL.revokeObjectURL(prev.previewUrl);
+
+    updateItemProgress(item.id, {
+      selectedFile: file,
+      previewUrl: file ? URL.createObjectURL(file) : null,
+      error: null,
+    });
+  };
+
+  // === Step 2: Submit jawaban (POST .../item/:questionItemId/submit) ===
+  const handleSubmitItem = async (item: DetailItem) => {
+    const progress = getItemProgress(item.id);
+    if (!progress.studentQuestionItemId) return;
+    if (!progress.selectedFile) {
+      updateItemProgress(item.id, { error: 'Pilih foto jawaban dulu sebelum submit.' });
+      return;
+    }
+
+    updateItemProgress(item.id, { status: 'submitting', error: null });
+
+    try {
+      const formData = new FormData();
+      formData.append('file', progress.selectedFile);
+
+      const res = await fetch(
+        `${API_BASE}/student-assessments/${progress.studentQuestionItemId}/item/${item.id}/submit`,
+        {
+          method: 'POST',
+          body: formData,
+        },
+      );
+
+      if (!res.ok) throw new Error('Gagal submit jawaban');
+
+      const result = (await res.json()) as SubmitAnswerResponse;
+
+      updateItemProgress(item.id, {
+        status: 'submitted',
+        lastResult: result,
+        error: null,
+      });
+    } catch (error) {
+      console.error('Gagal submit item:', error);
+      updateItemProgress(item.id, {
+        status: 'started',
+        error: 'Gagal mengirim jawaban. Coba lagi.',
+      });
+    }
+  };
+
+  // === Coba lagi jika jawaban salah (isCorrect: false) ===
+  const handleRetryItem = (item: DetailItem) => {
+    const progress = getItemProgress(item.id);
+    if (progress.previewUrl) URL.revokeObjectURL(progress.previewUrl);
+
+    // studentQuestionItemId tetap dipakai (sesi pengerjaan yang sama), hanya reset file & result
+    updateItemProgress(item.id, {
+      status: 'started',
+      selectedFile: null,
+      previewUrl: null,
+      lastResult: null,
+      error: null,
+    });
+  };
+
   return (
     <main className="min-h-screen bg-[#FDFBF7] p-3 sm:p-4 md:p-6 font-sans">
       <div className="max-w-6xl mx-auto space-y-5">
-        
+
         {/* Back Button - Lebih Kecil */}
         <button
           onClick={() => router.back()}
@@ -334,25 +547,20 @@ export default function DetailKelasSiswaPageCompact() {
                               <MiniStat label="Belum" value={q.notStartedItems} />
                             </div>
 
-                            {/* Items List - Lebih Compact */}
+                            {/* Items List - Lebih Compact, sekarang dengan alur start -> upload -> submit -> retry */}
                             {q.items.length > 0 && (
                               <div className="space-y-2 pt-1">
                                 {q.items.map((item) => (
-                                  <div key={item.id} className="flex gap-3 bg-[#F9FBF7] border border-[#ECF1E8] rounded-xl p-2.5">
-                                    <div 
-                                      className="w-11 h-11 rounded-lg bg-cover bg-center border border-[#DDE2D8] shrink-0" 
-                                      style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
-                                    />
-                                    <div className="min-w-0 flex-1 text-xs">
-                                      <p className="font-bold text-[#2D332D] truncate">{item.name}</p>
-                                      <p className="text-[#6B705C] mt-0.5">
-                                        Rp{item.price} · Qty {item.quantity} · Bobot {item.weight}
-                                      </p>
-                                      <p className="text-[#8DAA7B] font-bold mt-0.5">
-                                        {item.status} · {item.answerCount} jawaban
-                                      </p>
-                                    </div>
-                                  </div>
+                                  <ItemWorkCard
+                                    key={item.id}
+                                    lvl={lvl}
+                                    item={item}
+                                    progress={getItemProgress(item.id)}
+                                    onStart={() => handleStartItem(lvl, item)}
+                                    onFileSelect={(file) => handleFileSelect(item, file)}
+                                    onSubmit={() => handleSubmitItem(item)}
+                                    onRetry={() => handleRetryItem(item)}
+                                  />
                                 ))}
                               </div>
                             )}
@@ -368,6 +576,147 @@ export default function DetailKelasSiswaPageCompact() {
         </div>
       </div>
     </main>
+  );
+}
+
+// ==== Kartu pengerjaan per item: Start -> Pilih foto -> Submit -> (Retry jika salah) ====
+function ItemWorkCard({
+  lvl,
+  item,
+  progress,
+  onStart,
+  onFileSelect,
+  onSubmit,
+  onRetry,
+}: {
+  lvl: DetailLevel;
+  item: DetailItem;
+  progress: ItemProgressState;
+  onStart: () => void;
+  onFileSelect: (file: File | null) => void;
+  onSubmit: () => void;
+  onRetry: () => void;
+}) {
+  // Item sudah pernah selesai (dari data awal, sebelum interaksi apapun di sesi ini)
+  const alreadyCompletedFromServer =
+    item.status === 'COMPLETED' && progress.status === 'idle' && item.latestAnswer?.isCorrect;
+
+  const isCorrectNow = progress.lastResult?.isCorrect ?? (alreadyCompletedFromServer ? true : null);
+
+  return (
+    <div className="bg-[#F9FBF7] border border-[#ECF1E8] rounded-xl p-2.5 space-y-2.5">
+      <div className="flex gap-3">
+        <div
+          className="w-11 h-11 rounded-lg bg-cover bg-center border border-[#DDE2D8] shrink-0"
+          style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
+        />
+        <div className="min-w-0 flex-1 text-xs">
+          <p className="font-bold text-[#2D332D] truncate">{item.name}</p>
+          <p className="text-[#6B705C] mt-0.5">
+            Rp{item.price} · Qty {item.quantity} · Bobot {item.weight}
+          </p>
+          <p className="text-[#8DAA7B] font-bold mt-0.5">
+            {item.status} · {item.answerCount} jawaban
+          </p>
+        </div>
+      </div>
+
+      {/* Sudah completed & benar sebelum interaksi apapun di sesi ini */}
+      {alreadyCompletedFromServer && (
+        <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5">
+          <CheckCircle2 size={14} /> Sudah dijawab dengan benar (skor {item.latestAnswer?.score ?? 100})
+        </div>
+      )}
+
+      {/* State: idle (belum start), item belum pernah completed sebelumnya */}
+      {!alreadyCompletedFromServer && progress.status === 'idle' && (
+        <button
+          onClick={onStart}
+          disabled={lvl.isLocked}
+          className="flex items-center gap-1 text-xs bg-[#8DAA7B] text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-[#6f8a63] disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <PlayCircle size={13} /> Start Item
+        </button>
+      )}
+
+      {progress.status === 'starting' && (
+        <div className="flex items-center gap-1.5 text-[11px] text-[#6B705C] font-bold">
+          <Loader2 size={13} className="animate-spin" /> Memulai pengerjaan...
+        </div>
+      )}
+
+      {/* State: sudah start, belum submit -> tampilkan uploader */}
+      {(progress.status === 'started' || progress.status === 'submitting') && (
+        <div className="space-y-2">
+          <label className="flex items-center gap-2 text-[11px] font-bold text-[#6B705C] bg-white border border-dashed border-[#DDE2D8] rounded-lg px-2.5 py-2 cursor-pointer hover:bg-[#F5F7F2]">
+            <Upload size={14} className="text-[#8DAA7B]" />
+            {progress.selectedFile ? progress.selectedFile.name : 'Pilih foto jawaban'}
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => onFileSelect(e.target.files?.[0] ?? null)}
+            />
+          </label>
+
+          {progress.previewUrl && (
+            <div
+              className="w-16 h-16 rounded-lg bg-cover bg-center border border-[#DDE2D8]"
+              style={{ backgroundImage: `url(${progress.previewUrl})` }}
+            />
+          )}
+
+          <button
+            onClick={onSubmit}
+            disabled={!progress.selectedFile || progress.status === 'submitting'}
+            className="flex items-center gap-1 text-xs bg-[#2D332D] text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-black disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {progress.status === 'submitting' ? (
+              <>
+                <Loader2 size={13} className="animate-spin" /> Mengirim...
+              </>
+            ) : (
+              'Submit Jawaban'
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* State: sudah pernah submit di sesi ini -> tampilkan hasil */}
+      {progress.status === 'submitted' && progress.lastResult && (
+        <div className="space-y-2">
+          <div
+            className={`flex items-center gap-1.5 text-[11px] font-bold rounded-lg px-2.5 py-1.5 border ${
+              isCorrectNow
+                ? 'text-emerald-600 bg-emerald-50 border-emerald-200'
+                : 'text-red-600 bg-red-50 border-red-200'
+            }`}
+          >
+            {isCorrectNow ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+            {isCorrectNow
+              ? `Benar! Skor ${progress.lastResult.score}`
+              : `Belum tepat (skor ${progress.lastResult.score}). Coba lagi.`}
+          </div>
+
+          <p className="text-[10px] text-[#6B705C]">
+            SSIM {progress.lastResult.ssim.toFixed(2)} · MSE {progress.lastResult.mse.toFixed(2)}
+          </p>
+
+          {!isCorrectNow && (
+            <button
+              onClick={onRetry}
+              className="flex items-center gap-1 text-xs bg-amber-500 text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-amber-600"
+            >
+              <RotateCcw size={13} /> Coba Lagi
+            </button>
+          )}
+        </div>
+      )}
+
+      {progress.error && (
+        <p className="text-[10px] text-red-600 font-bold">{progress.error}</p>
+      )}
+    </div>
   );
 }
 

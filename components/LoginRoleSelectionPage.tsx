@@ -17,7 +17,7 @@ export default function LoginRoleSelection() {
       {/* Background decoration */}
       <div className="absolute -bottom-10 -left-10 w-32 h-32 bg-[#E1EAD8] opacity-40 rounded-full blur-2xl pointer-events-none"></div>
       <div className="absolute -top-10 -right-10 w-40 h-40 bg-[#FFD166] opacity-10 rounded-full blur-3xl pointer-events-none"></div>
-
+    
       {/* Main Content */}
       <div className="flex-1 flex flex-col justify-between z-10">
         {/* Header Section */}
