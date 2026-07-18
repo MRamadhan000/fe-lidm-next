@@ -26,24 +26,23 @@ type AdminTab =
   | "classes"
   | "logs";
 
-// === TAB LIST (biar simpel & mudah di-maintain) ===
+// === TAB LIST ===
 const tabList: {
   id: AdminTab;
   label: string;
   icon: React.ReactNode;
 }[] = [
   { id: "dashboard", label: "Utama", icon: <BarChart3 size={14} /> },
-  { id: "modules", label: "Modul Belajar", icon: <BookOpen size={14} /> },
-  { id: "teachers", label: "Akun Guru", icon: <UserCheck size={14} /> },
-  { id: "students", label: "Akun Siswa", icon: <GraduationCap size={14} /> },
-  { id: "classes", label: "Kelas SLB", icon: <Layers size={14} /> },
-  { id: "logs", label: "Log Audit", icon: <ClipboardList size={14} /> },
+  { id: "modules", label: "Modul", icon: <BookOpen size={14} /> },
+  { id: "teachers", label: "Guru", icon: <UserCheck size={14} /> },
+  { id: "students", label: "Siswa", icon: <GraduationCap size={14} /> },
+  { id: "classes", label: "Kelas", icon: <Layers size={14} /> },
+  { id: "logs", label: "Log", icon: <ClipboardList size={14} /> },
 ];
 
 export default function AdminDashboardPage() {
   const [activeTab, setActiveTab] = useState<AdminTab>("dashboard");
 
-  // Dummy data lokal
   const [students] = useState([
     { id: "s1", name: "Aurelia Putri", points: 2450, completedGames: 18 },
     { id: "s2", name: "Dika Wijaya", points: 1890, completedGames: 14 },
@@ -119,8 +118,8 @@ export default function AdminDashboardPage() {
         </div>
       </div>
 
-      {/* HORIZONTALLY SCROLLABLE TABS - SEKARANG DILOOP BIAR SIMPEL */}
-      <div className="bg-white border-b border-[#DDE2D8] py-2 flex gap-1 overflow-x-auto scrollbar-none shrink-0 px-3 select-none">
+      {/* ========== DESKTOP TAB (Top) ========== */}
+      <div className="hidden md:block bg-white border-b border-[#DDE2D8] py-2 flex gap-1 overflow-x-auto scrollbar-none shrink-0 px-3 select-none">
         {tabList.map((tab) => (
           <button
             key={tab.id}
@@ -137,9 +136,9 @@ export default function AdminDashboardPage() {
         ))}
       </div>
 
-      {/* MAIN CONTENT AREA */}
-      <div className="flex-1 overflow-y-auto p-4 pb-12 bg-[#F5F7F2]/40">
-        {/* TAB: DASHBOARD / UTAMA */}
+      {/* ========== MAIN CONTENT ========== */}
+      <div className="flex-1 overflow-y-auto p-4 pb-20 md:pb-12 bg-[#F5F7F2]/40">
+        {/* TAB: DASHBOARD */}
         {activeTab === "dashboard" && (
           <div className="space-y-6">
             <div>
@@ -151,7 +150,7 @@ export default function AdminDashboardPage() {
               </p>
             </div>
 
-            {/* Stat Cards - juga di-loop biar rapi */}
+            {/* Stat Cards */}
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
               {[
                 { icon: <Users size={20} />, label: "Total Siswa", value: totalStudents },
@@ -233,6 +232,7 @@ export default function AdminDashboardPage() {
           </div>
         )}
 
+        {/* TAB: KELAS SLB */}
         {activeTab === "classes" && (
           <div className="h-full">
             <AdminTabKelas
@@ -242,7 +242,7 @@ export default function AdminDashboardPage() {
             />
           </div>
         )}
-  
+
         {/* TAB: LOG AUDIT */}
         {activeTab === "logs" && (
           <div className="bg-white rounded-2xl p-6 shadow-sm border border-[#E1EAD8]">
@@ -250,7 +250,6 @@ export default function AdminDashboardPage() {
               <ClipboardList className="text-[#8DAA7B]" size={22} />
               <h3 className="font-black text-xl text-[#4A5043]">Log Audit Sistem</h3>
             </div>
-
             <div className="space-y-3">
               {dummyLogs.map((log, index) => (
                 <div key={index} className="flex items-start gap-4 p-4 bg-[#F5F7F2] rounded-2xl">
@@ -267,6 +266,55 @@ export default function AdminDashboardPage() {
             </div>
           </div>
         )}
+      </div>
+
+      {/* ========== MOBILE BOTTOM NAVIGATION ========== */}
+      <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-[#DDE2D8] z-50">
+        <div className="flex justify-around items-center py-1.5 px-1">
+          {tabList.map((tab) => {
+            const isActive = activeTab === tab.id;
+            const isUtama = tab.id === "dashboard";
+
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`flex flex-col items-center justify-center px-1 py-1 rounded-xl transition-all min-w-[52px] relative ${
+                  isActive ? "text-[#8DAA7B]" : "text-[#6B705C]"
+                }`}
+              >
+                {/* Special styling for "Utama" tab - lifted up + more prominent */}
+                <div
+                  className={`
+                    flex items-center justify-center transition-all
+                    ${isUtama ? "-mt-2 scale-110" : ""}
+                    ${isActive && isUtama ? "drop-shadow-md" : ""}
+                  `}
+                >
+                  <div
+                    className={`
+                      p-1.5 rounded-full transition-all
+                      ${isUtama && isActive ? "bg-[#E1EAD8]" : ""}
+                    `}
+                  >
+                    {React.cloneElement(tab.icon as React.ReactElement, { 
+                      // size: isUtama ? 20 : 17 
+                    })}
+                  </div>
+                </div>
+
+                <span 
+                  className={`
+                    text-[8.5px] font-bold tracking-tight mt-0.5
+                    ${isUtama ? "font-black" : ""}
+                  `}
+                >
+                  {tab.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
