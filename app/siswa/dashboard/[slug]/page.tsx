@@ -1,8 +1,23 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Loader2, PlayCircle, Target, Trophy, User, Upload, CheckCircle2, XCircle, RotateCcw } from 'lucide-react';
+import {
+  ArrowLeft,
+  Loader2,
+  PlayCircle,
+  Target,
+  Trophy,
+  User,
+  Camera,
+  X,
+  RotateCcw,
+  CheckCircle2,
+  XCircle,
+  Search,
+  AlertTriangle,
+  Send,
+} from 'lucide-react';
 
 interface StudentAnswer {
   id: string;
@@ -198,16 +213,16 @@ interface SubmitAnswerResponse {
   answeredAt: string;
 }
 
-// Status pengerjaan tiap item di sisi UI (client-side state machine)
-type ItemUiStatus = 'idle' | 'starting' | 'started' | 'submitting' | 'submitted';
-
+// Progress kerja tiap item (bertahan selama halaman ini terbuka)
 interface ItemProgressState {
   studentQuestionItemId: string | null;
-  status: ItemUiStatus;
-  selectedFile: File | null;
-  previewUrl: string | null;
   lastResult: SubmitAnswerResponse | null;
-  error: string | null;
+}
+
+// Target aktif: item + level yang sedang dikerjakan lewat modal kamera
+interface ActiveTarget {
+  lvl: DetailLevel;
+  item: DetailItem;
 }
 
 const API_BASE = 'http://localhost:3000';
@@ -224,6 +239,9 @@ export default function DetailKelasSiswaPageCompact() {
 
   // key = questionItemId (item.id) -> progress state item tersebut
   const [itemProgress, setItemProgress] = useState<Record<string, ItemProgressState>>({});
+
+  // item yang sedang dibuka lewat modal "cari & foto barang"
+  const [activeTarget, setActiveTarget] = useState<ActiveTarget | null>(null);
 
   useEffect(() => {
     if (!slug) return;
@@ -272,127 +290,55 @@ export default function DetailKelasSiswaPageCompact() {
   };
 
   const getItemProgress = (itemId: string): ItemProgressState => {
-    return (
-      itemProgress[itemId] ?? {
-        studentQuestionItemId: null,
-        status: 'idle',
-        selectedFile: null,
-        previewUrl: null,
-        lastResult: null,
-        error: null,
-      }
-    );
+    return itemProgress[itemId] ?? { studentQuestionItemId: null, lastResult: null };
   };
 
-  const updateItemProgress = (itemId: string, patch: Partial<ItemProgressState>) => {
+  // === Panggil API /student-assessments/start, kembalikan studentQuestionItemId ===
+  const ensureStarted = async (lvl: DetailLevel, item: DetailItem): Promise<string> => {
+    const existing = getItemProgress(item.id).studentQuestionItemId;
+    if (existing) return existing;
+    if (!studentId) throw new Error('Sesi siswa tidak ditemukan.');
+
+    const res = await fetch(`${API_BASE}/student-assessments/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        studentId,
+        classLevelId: lvl.classLevelId,
+        questionItemId: item.id,
+      }),
+    });
+    if (!res.ok) throw new Error('Gagal memulai pengerjaan item');
+
+    const result = (await res.json()) as StartAnswerResponse;
+
     setItemProgress((prev) => ({
       ...prev,
-      [itemId]: { ...getItemProgress(itemId), ...prev[itemId], ...patch },
+      [item.id]: { ...getItemProgress(item.id), studentQuestionItemId: result.id },
     }));
+
+    return result.id;
   };
 
-  // === Step 1: Mulai pengerjaan item (POST /student-assessments/start) ===
-  const handleStartItem = async (lvl: DetailLevel, item: DetailItem) => {
-    if (!studentId) return;
+  // === Panggil API submit foto jawaban ===
+  const submitPhoto = async (item: DetailItem, studentQuestionItemId: string, blob: Blob): Promise<SubmitAnswerResponse> => {
+    const formData = new FormData();
+    formData.append('file', blob, 'jawaban.jpg');
 
-    updateItemProgress(item.id, { status: 'starting', error: null });
+    const res = await fetch(
+      `${API_BASE}/student-assessments/${studentQuestionItemId}/item/${item.id}/submit`,
+      { method: 'POST', body: formData },
+    );
+    if (!res.ok) throw new Error('Gagal mengirim jawaban');
 
-    try {
-      const res = await fetch(`${API_BASE}/student-assessments/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentId,
-          classLevelId: lvl.classLevelId,
-          questionItemId: item.id,
-        }),
-      });
+    const result = (await res.json()) as SubmitAnswerResponse;
 
-      if (!res.ok) throw new Error('Gagal memulai pengerjaan item');
+    setItemProgress((prev) => ({
+      ...prev,
+      [item.id]: { ...getItemProgress(item.id), lastResult: result },
+    }));
 
-      const result = (await res.json()) as StartAnswerResponse;
-
-      // simpan studentQuestionItemId (result.id) untuk dipakai saat submit
-      updateItemProgress(item.id, {
-        studentQuestionItemId: result.id,
-        status: 'started',
-        error: null,
-      });
-    } catch (error) {
-      console.error('Gagal start item:', error);
-      updateItemProgress(item.id, {
-        status: 'idle',
-        error: 'Gagal memulai pengerjaan. Coba lagi.',
-      });
-    }
-  };
-
-  // === Pilih file foto jawaban ===
-  const handleFileSelect = (item: DetailItem, file: File | null) => {
-    const prev = getItemProgress(item.id);
-    if (prev.previewUrl) URL.revokeObjectURL(prev.previewUrl);
-
-    updateItemProgress(item.id, {
-      selectedFile: file,
-      previewUrl: file ? URL.createObjectURL(file) : null,
-      error: null,
-    });
-  };
-
-  // === Step 2: Submit jawaban (POST .../item/:questionItemId/submit) ===
-  const handleSubmitItem = async (item: DetailItem) => {
-    const progress = getItemProgress(item.id);
-    if (!progress.studentQuestionItemId) return;
-    if (!progress.selectedFile) {
-      updateItemProgress(item.id, { error: 'Pilih foto jawaban dulu sebelum submit.' });
-      return;
-    }
-
-    updateItemProgress(item.id, { status: 'submitting', error: null });
-
-    try {
-      const formData = new FormData();
-      formData.append('file', progress.selectedFile);
-
-      const res = await fetch(
-        `${API_BASE}/student-assessments/${progress.studentQuestionItemId}/item/${item.id}/submit`,
-        {
-          method: 'POST',
-          body: formData,
-        },
-      );
-
-      if (!res.ok) throw new Error('Gagal submit jawaban');
-
-      const result = (await res.json()) as SubmitAnswerResponse;
-
-      updateItemProgress(item.id, {
-        status: 'submitted',
-        lastResult: result,
-        error: null,
-      });
-    } catch (error) {
-      console.error('Gagal submit item:', error);
-      updateItemProgress(item.id, {
-        status: 'started',
-        error: 'Gagal mengirim jawaban. Coba lagi.',
-      });
-    }
-  };
-
-  // === Coba lagi jika jawaban salah (isCorrect: false) ===
-  const handleRetryItem = (item: DetailItem) => {
-    const progress = getItemProgress(item.id);
-    if (progress.previewUrl) URL.revokeObjectURL(progress.previewUrl);
-
-    // studentQuestionItemId tetap dipakai (sesi pengerjaan yang sama), hanya reset file & result
-    updateItemProgress(item.id, {
-      status: 'started',
-      selectedFile: null,
-      previewUrl: null,
-      lastResult: null,
-      error: null,
-    });
+    return result;
   };
 
   return (
@@ -547,19 +493,16 @@ export default function DetailKelasSiswaPageCompact() {
                               <MiniStat label="Belum" value={q.notStartedItems} />
                             </div>
 
-                            {/* Items List - Lebih Compact, sekarang dengan alur start -> upload -> submit -> retry */}
+                            {/* Items List */}
                             {q.items.length > 0 && (
                               <div className="space-y-2 pt-1">
                                 {q.items.map((item) => (
-                                  <ItemWorkCard
+                                  <ItemRow
                                     key={item.id}
-                                    lvl={lvl}
                                     item={item}
                                     progress={getItemProgress(item.id)}
-                                    onStart={() => handleStartItem(lvl, item)}
-                                    onFileSelect={(file) => handleFileSelect(item, file)}
-                                    onSubmit={() => handleSubmitItem(item)}
-                                    onRetry={() => handleRetryItem(item)}
+                                    locked={lvl.isLocked}
+                                    onOpen={() => setActiveTarget({ lvl, item })}
                                   />
                                 ))}
                               </div>
@@ -575,147 +518,423 @@ export default function DetailKelasSiswaPageCompact() {
           ))}
         </div>
       </div>
+
+      {/* Modal cari & foto barang */}
+      {activeTarget && (
+        <FindAndCaptureModal
+          item={activeTarget.item}
+          onClose={() => setActiveTarget(null)}
+          onEnsureStarted={() => ensureStarted(activeTarget.lvl, activeTarget.item)}
+          onSubmitPhoto={(studentQuestionItemId, blob) => submitPhoto(activeTarget.item, studentQuestionItemId, blob)}
+        />
+      )}
     </main>
   );
 }
 
-// ==== Kartu pengerjaan per item: Start -> Pilih foto -> Submit -> (Retry jika salah) ====
-function ItemWorkCard({
-  lvl,
+// ==== Baris ringkas tiap barang di dalam daftar soal ====
+function ItemRow({
   item,
   progress,
-  onStart,
-  onFileSelect,
-  onSubmit,
-  onRetry,
+  locked,
+  onOpen,
 }: {
-  lvl: DetailLevel;
   item: DetailItem;
   progress: ItemProgressState;
-  onStart: () => void;
-  onFileSelect: (file: File | null) => void;
-  onSubmit: () => void;
-  onRetry: () => void;
+  locked: boolean;
+  onOpen: () => void;
 }) {
-  // Item sudah pernah selesai (dari data awal, sebelum interaksi apapun di sesi ini)
-  const alreadyCompletedFromServer =
-    item.status === 'COMPLETED' && progress.status === 'idle' && item.latestAnswer?.isCorrect;
-
-  const isCorrectNow = progress.lastResult?.isCorrect ?? (alreadyCompletedFromServer ? true : null);
+  const result = progress.lastResult;
+  const isCorrectNow = result ? result.isCorrect : item.status === 'COMPLETED' && item.latestAnswer?.isCorrect;
+  const hasResultThisSession = result !== null;
 
   return (
-    <div className="bg-[#F9FBF7] border border-[#ECF1E8] rounded-xl p-2.5 space-y-2.5">
-      <div className="flex gap-3">
-        <div
-          className="w-11 h-11 rounded-lg bg-cover bg-center border border-[#DDE2D8] shrink-0"
-          style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
-        />
-        <div className="min-w-0 flex-1 text-xs">
-          <p className="font-bold text-[#2D332D] truncate">{item.name}</p>
-          <p className="text-[#6B705C] mt-0.5">
-            Rp{item.price} · Qty {item.quantity} · Bobot {item.weight}
+    <div className="flex gap-3 bg-[#F9FBF7] border border-[#ECF1E8] rounded-xl p-2.5 items-center">
+      <div
+        className="w-11 h-11 rounded-lg bg-cover bg-center border border-[#DDE2D8] shrink-0"
+        style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
+      />
+      <div className="min-w-0 flex-1 text-xs">
+        <p className="font-bold text-[#2D332D] truncate">{item.name}</p>
+        <p className="text-[#6B705C] mt-0.5">
+          Rp{item.price} · Qty {item.quantity} · Bobot {item.weight}
+        </p>
+        {isCorrectNow ? (
+          <p className="text-emerald-600 font-bold mt-0.5 flex items-center gap-1">
+            <CheckCircle2 size={12} /> Benar{hasResultThisSession && result ? ` · Skor ${result.score}` : ''}
           </p>
+        ) : hasResultThisSession && result ? (
+          <p className="text-red-600 font-bold mt-0.5 flex items-center gap-1">
+            <XCircle size={12} /> Belum tepat, coba lagi
+          </p>
+        ) : (
           <p className="text-[#8DAA7B] font-bold mt-0.5">
             {item.status} · {item.answerCount} jawaban
           </p>
-        </div>
+        )}
       </div>
 
-      {/* Sudah completed & benar sebelum interaksi apapun di sesi ini */}
-      {alreadyCompletedFromServer && (
-        <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5">
-          <CheckCircle2 size={14} /> Sudah dijawab dengan benar (skor {item.latestAnswer?.score ?? 100})
-        </div>
-      )}
-
-      {/* State: idle (belum start), item belum pernah completed sebelumnya */}
-      {!alreadyCompletedFromServer && progress.status === 'idle' && (
+      {!isCorrectNow && (
         <button
-          onClick={onStart}
-          disabled={lvl.isLocked}
-          className="flex items-center gap-1 text-xs bg-[#8DAA7B] text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-[#6f8a63] disabled:opacity-50 disabled:cursor-not-allowed"
+          onClick={onOpen}
+          disabled={locked}
+          className="shrink-0 flex items-center gap-1.5 text-xs bg-[#8DAA7B] text-white px-3 py-2 rounded-xl font-bold active:bg-[#6f8a63] disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <PlayCircle size={13} /> Start Item
+          <Camera size={15} />
+          {hasResultThisSession ? 'Foto Lagi' : 'Mulai'}
         </button>
       )}
+    </div>
+  );
+}
 
-      {progress.status === 'starting' && (
-        <div className="flex items-center gap-1.5 text-[11px] text-[#6B705C] font-bold">
-          <Loader2 size={13} className="animate-spin" /> Memulai pengerjaan...
-        </div>
-      )}
+// ============================================================
+// Modal: cari barang -> izinkan kamera -> foto -> kirim jawaban
+// Dirancang sederhana & ramah untuk anak tunagrahita:
+// - satu langkah jelas per layar
+// - teks pendek, kalimat sederhana
+// - tombol besar dengan ikon + tulisan (bukan ikon saja)
+// - warna & ikon dipakai bersamaan sebagai penanda benar/salah
+// ============================================================
 
-      {/* State: sudah start, belum submit -> tampilkan uploader */}
-      {(progress.status === 'started' || progress.status === 'submitting') && (
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-[11px] font-bold text-[#6B705C] bg-white border border-dashed border-[#DDE2D8] rounded-lg px-2.5 py-2 cursor-pointer hover:bg-[#F5F7F2]">
-            <Upload size={14} className="text-[#8DAA7B]" />
-            {progress.selectedFile ? progress.selectedFile.name : 'Pilih foto jawaban'}
-            <input
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => onFileSelect(e.target.files?.[0] ?? null)}
-            />
-          </label>
+type ModalStage = 'intro' | 'preparing' | 'camera' | 'camera-error' | 'captured' | 'submitting' | 'result';
 
-          {progress.previewUrl && (
-            <div
-              className="w-16 h-16 rounded-lg bg-cover bg-center border border-[#DDE2D8]"
-              style={{ backgroundImage: `url(${progress.previewUrl})` }}
-            />
-          )}
+function FindAndCaptureModal({
+  item,
+  onClose,
+  onEnsureStarted,
+  onSubmitPhoto,
+}: {
+  item: DetailItem;
+  onClose: () => void;
+  onEnsureStarted: () => Promise<string>;
+  onSubmitPhoto: (studentQuestionItemId: string, blob: Blob) => Promise<SubmitAnswerResponse>;
+}) {
+  const [stage, setStage] = useState<ModalStage>('intro');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [capturedPreviewUrl, setCapturedPreviewUrl] = useState<string | null>(null);
+  const [capturedBlob, setCapturedBlob] = useState<Blob | null>(null);
+  const [result, setResult] = useState<SubmitAnswerResponse | null>(null);
+  const [studentQuestionItemId, setStudentQuestionItemId] = useState<string | null>(null);
 
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  // Selalu matikan kamera saat modal ditutup / komponen dilepas
+  useEffect(() => {
+    return () => {
+      stopCamera();
+      if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const stopCamera = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  };
+
+  // Langkah 1: siswa klik "Ayo, Mulai!" di layar intro
+  const handleBeginSearch = async () => {
+    setErrorMessage(null);
+    setStage('preparing');
+
+    try {
+      const id = await onEnsureStarted();
+      setStudentQuestionItemId(id);
+      await openCamera();
+    } catch (error) {
+      console.error(error);
+      setErrorMessage('Belum bisa memulai soal ini. Coba lagi ya.');
+      setStage('intro');
+    }
+  };
+
+  const openCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: false,
+      });
+      streamRef.current = stream;
+      setStage('camera');
+
+      // videoRef baru terpasang setelah render, tunggu sebentar lalu attach stream
+      requestAnimationFrame(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+      });
+    } catch (error) {
+      console.error('Gagal akses kamera:', error);
+      setStage('camera-error');
+    }
+  };
+
+  // Langkah 2: siswa tekan tombol bulat besar untuk memotret
+  const handleTakePhoto = () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return;
+        stopCamera();
+        setCapturedBlob(blob);
+        setCapturedPreviewUrl(URL.createObjectURL(blob));
+        setStage('captured');
+      },
+      'image/jpeg',
+      0.9,
+    );
+  };
+
+  // Ambil ulang foto: buka kamera lagi
+  const handleRetakePhoto = async () => {
+    if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
+    setCapturedPreviewUrl(null);
+    setCapturedBlob(null);
+    setStage('preparing');
+    await openCamera();
+  };
+
+  // Langkah 3: kirim jawaban
+  const handleSendAnswer = async () => {
+    if (!studentQuestionItemId || !capturedBlob) return;
+    setErrorMessage(null);
+    setStage('submitting');
+
+    try {
+      const res = await onSubmitPhoto(studentQuestionItemId, capturedBlob);
+      setResult(res);
+      setStage('result');
+    } catch (error) {
+      console.error(error);
+      setErrorMessage('Jawaban gagal dikirim. Coba kirim lagi ya.');
+      setStage('captured');
+    }
+  };
+
+  // Coba lagi setelah jawaban salah: langsung buka kamera lagi
+  const handleTryAgainAfterWrong = async () => {
+    setResult(null);
+    if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
+    setCapturedPreviewUrl(null);
+    setCapturedBlob(null);
+    setStage('preparing');
+    await openCamera();
+  };
+
+  const handleCloseModal = () => {
+    stopCamera();
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3">
+      <div className="bg-[#FDFBF7] w-full max-w-md rounded-3xl overflow-hidden shadow-2xl relative max-h-[92vh] flex flex-col">
+
+        {/* Tombol tutup - selalu ada, besar & jelas */}
+        {stage !== 'camera' && (
           <button
-            onClick={onSubmit}
-            disabled={!progress.selectedFile || progress.status === 'submitting'}
-            className="flex items-center gap-1 text-xs bg-[#2D332D] text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-black disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={handleCloseModal}
+            aria-label="Tutup"
+            className="absolute top-3 right-3 z-10 bg-white/90 hover:bg-white text-[#2D332D] rounded-full p-2 shadow-md"
           >
-            {progress.status === 'submitting' ? (
+            <X size={20} />
+          </button>
+        )}
+
+        {/* ===== Layar 1: Perkenalan barang yang harus dicari ===== */}
+        {stage === 'intro' && (
+          <div className="p-6 flex flex-col items-center text-center gap-4">
+            <div className="flex items-center gap-2 text-[#8DAA7B] font-black text-sm">
+              <Search size={18} /> Ayo Cari Barang Ini!
+            </div>
+
+            <div
+              className="w-48 h-48 rounded-3xl bg-cover bg-center border-4 border-[#8DAA7B]/30 shadow-inner"
+              style={item.image ? { backgroundImage: `url(${item.image})` } : { backgroundColor: '#E8ECE4' }}
+            />
+
+            <p className="text-2xl font-black text-[#2D332D]">{item.name}</p>
+            <p className="text-sm text-[#6B705C] leading-relaxed">
+              Carilah barang ini di sekitarmu.
+              <br />
+              Kalau sudah ketemu, foto barangnya ya!
+            </p>
+
+            {errorMessage && (
+              <p className="text-xs text-red-600 font-bold bg-red-50 border border-red-200 rounded-xl px-3 py-2">
+                {errorMessage}
+              </p>
+            )}
+
+            <button
+              onClick={handleBeginSearch}
+              className="w-full flex items-center justify-center gap-2 text-lg bg-[#8DAA7B] text-white px-5 py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+            >
+              <PlayCircle size={22} /> Ayo, Mulai!
+            </button>
+          </div>
+        )}
+
+        {/* ===== Layar: menyiapkan (start soal / buka kamera) ===== */}
+        {stage === 'preparing' && (
+          <div className="p-10 flex flex-col items-center text-center gap-3">
+            <Loader2 size={36} className="animate-spin text-[#8DAA7B]" />
+            <p className="text-base font-black text-[#2D332D]">Tunggu sebentar ya...</p>
+            <p className="text-xs text-[#6B705C]">Kamera sedang disiapkan.</p>
+          </div>
+        )}
+
+        {/* ===== Layar: kamera gagal dibuka / izin ditolak ===== */}
+        {stage === 'camera-error' && (
+          <div className="p-6 flex flex-col items-center text-center gap-4">
+            <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center">
+              <AlertTriangle size={30} className="text-amber-500" />
+            </div>
+            <p className="text-lg font-black text-[#2D332D]">Kamera Belum Bisa Dibuka</p>
+            <p className="text-sm text-[#6B705C] leading-relaxed">
+              Tolong minta bantuan guru atau orang tua untuk mengizinkan kamera di browser ya.
+            </p>
+            <button
+              onClick={handleBeginSearch}
+              className="w-full flex items-center justify-center gap-2 text-base bg-[#8DAA7B] text-white px-5 py-3.5 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+            >
+              <RotateCcw size={18} /> Coba Lagi
+            </button>
+          </div>
+        )}
+
+        {/* ===== Layar: overlay kamera fullscreen dalam modal ===== */}
+        {stage === 'camera' && (
+          <div className="relative bg-black flex-1 min-h-[70vh] flex items-center justify-center overflow-hidden">
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+
+            {/* Pengingat barang target, mengambang di atas kamera */}
+            <div className="absolute top-3 left-3 right-3 flex items-center gap-2 bg-black/50 backdrop-blur-sm rounded-2xl px-3 py-2">
+              <div
+                className="w-9 h-9 rounded-lg bg-cover bg-center border border-white/40 shrink-0"
+                style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
+              />
+              <p className="text-white text-sm font-black truncate">Carilah: {item.name}</p>
+            </div>
+
+            <button
+              onClick={handleCloseModal}
+              aria-label="Tutup kamera"
+              className="absolute top-3 right-3 bg-white/90 hover:bg-white text-[#2D332D] rounded-full p-2 shadow-md ml-2"
+              style={{ marginTop: '3.25rem' }}
+            >
+              <X size={18} />
+            </button>
+
+            {/* Tombol jepret besar di bawah, seperti aplikasi kamera pada umumnya */}
+            <div className="absolute bottom-6 left-0 right-0 flex flex-col items-center gap-2">
+              <button
+                onClick={handleTakePhoto}
+                aria-label="Ambil foto"
+                className="w-20 h-20 rounded-full bg-white border-4 border-[#8DAA7B] shadow-xl active:scale-95 flex items-center justify-center"
+              >
+                <Camera size={30} className="text-[#8DAA7B]" />
+              </button>
+              <p className="text-white text-xs font-black bg-black/40 rounded-full px-3 py-1">Tekan untuk Foto</p>
+            </div>
+          </div>
+        )}
+
+        {/* ===== Layar: hasil foto, pilih kirim atau ulangi ===== */}
+        {stage === 'captured' && capturedPreviewUrl && (
+          <div className="p-5 flex flex-col items-center text-center gap-3">
+            <p className="text-base font-black text-[#2D332D]">Foto Sudah Bagus?</p>
+            <div
+              className="w-full aspect-square rounded-2xl bg-cover bg-center border-2 border-[#DDE2D8]"
+              style={{ backgroundImage: `url(${capturedPreviewUrl})` }}
+            />
+
+            {errorMessage && (
+              <p className="text-xs text-red-600 font-bold bg-red-50 border border-red-200 rounded-xl px-3 py-2 w-full">
+                {errorMessage}
+              </p>
+            )}
+
+            <div className="w-full grid grid-cols-2 gap-2.5">
+              <button
+                onClick={handleRetakePhoto}
+                className="flex items-center justify-center gap-1.5 text-sm bg-white border-2 border-[#DDE2D8] text-[#6B705C] px-3 py-3.5 rounded-2xl font-black active:bg-[#F5F7F2]"
+              >
+                <RotateCcw size={17} /> Foto Ulang
+              </button>
+              <button
+                onClick={handleSendAnswer}
+                className="flex items-center justify-center gap-1.5 text-sm bg-[#8DAA7B] text-white px-3 py-3.5 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+              >
+                <Send size={17} /> Kirim
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ===== Layar: mengirim jawaban ===== */}
+        {stage === 'submitting' && (
+          <div className="p-10 flex flex-col items-center text-center gap-3">
+            <Loader2 size={36} className="animate-spin text-[#8DAA7B]" />
+            <p className="text-base font-black text-[#2D332D]">Sedang Mengirim...</p>
+            <p className="text-xs text-[#6B705C]">Sabar sebentar ya.</p>
+          </div>
+        )}
+
+        {/* ===== Layar: hasil jawaban ===== */}
+        {stage === 'result' && result && (
+          <div className="p-6 flex flex-col items-center text-center gap-4">
+            {result.isCorrect ? (
               <>
-                <Loader2 size={13} className="animate-spin" /> Mengirim...
+                <div className="w-20 h-20 rounded-full bg-emerald-100 flex items-center justify-center">
+                  <CheckCircle2 size={44} className="text-emerald-500" />
+                </div>
+                <p className="text-2xl font-black text-emerald-600">Hebat, Benar!</p>
+                <p className="text-sm text-[#6B705C]">Kamu berhasil menemukan {item.name}. Skor kamu: {result.score}.</p>
+                <button
+                  onClick={handleCloseModal}
+                  className="w-full flex items-center justify-center gap-2 text-lg bg-emerald-500 text-white px-5 py-4 rounded-2xl font-black active:bg-emerald-600 shadow-lg"
+                >
+                  <CheckCircle2 size={20} /> Selesai
+                </button>
               </>
             ) : (
-              'Submit Jawaban'
+              <>
+                <div className="w-20 h-20 rounded-full bg-amber-100 flex items-center justify-center">
+                  <XCircle size={44} className="text-amber-500" />
+                </div>
+                <p className="text-2xl font-black text-amber-600">Belum Tepat</p>
+                <p className="text-sm text-[#6B705C]">
+                  Sepertinya itu bukan {item.name}. Tidak apa-apa, coba foto lagi ya, kamu pasti bisa!
+                </p>
+                <button
+                  onClick={handleTryAgainAfterWrong}
+                  className="w-full flex items-center justify-center gap-2 text-lg bg-[#8DAA7B] text-white px-5 py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+                >
+                  <RotateCcw size={20} /> Coba Lagi
+                </button>
+              </>
             )}
-          </button>
-        </div>
-      )}
-
-      {/* State: sudah pernah submit di sesi ini -> tampilkan hasil */}
-      {progress.status === 'submitted' && progress.lastResult && (
-        <div className="space-y-2">
-          <div
-            className={`flex items-center gap-1.5 text-[11px] font-bold rounded-lg px-2.5 py-1.5 border ${
-              isCorrectNow
-                ? 'text-emerald-600 bg-emerald-50 border-emerald-200'
-                : 'text-red-600 bg-red-50 border-red-200'
-            }`}
-          >
-            {isCorrectNow ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
-            {isCorrectNow
-              ? `Benar! Skor ${progress.lastResult.score}`
-              : `Belum tepat (skor ${progress.lastResult.score}). Coba lagi.`}
           </div>
-
-          <p className="text-[10px] text-[#6B705C]">
-            SSIM {progress.lastResult.ssim.toFixed(2)} · MSE {progress.lastResult.mse.toFixed(2)}
-          </p>
-
-          {!isCorrectNow && (
-            <button
-              onClick={onRetry}
-              className="flex items-center gap-1 text-xs bg-amber-500 text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-amber-600"
-            >
-              <RotateCcw size={13} /> Coba Lagi
-            </button>
-          )}
-        </div>
-      )}
-
-      {progress.error && (
-        <p className="text-[10px] text-red-600 font-bold">{progress.error}</p>
-      )}
+        )}
+      </div>
     </div>
   );
 }
