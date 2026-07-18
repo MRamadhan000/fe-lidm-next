@@ -37,7 +37,6 @@ export default function TabAdminModulBelajarLevel({
                   : 'bg-[#F5F7F2] text-[#6B705C] hover:bg-[#E1EAD8]/50 border border-[#DDE2D8]'
               }`}
             >
-              <span className="block text-[11px] uppercase tracking-wider opacity-80">Level {lvl.orderNumber}</span>
               <span className="block text-sm mt-0.5">{lvl.name}</span>
               <span className="block mt-1 font-medium text-[10px] leading-snug opacity-90">{lvl.description}</span>
               <span className="block mt-1 text-[10px] opacity-75">Bobot: {lvl.weight} | Modul: {lvl.modules?.length || 0}</span>
