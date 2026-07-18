@@ -121,7 +121,7 @@ export default function TabAdminModulBelajarSoal({
 
     setIsSubmitting(true);
     try {
-      const questionResponse = await fetch('http://localhost:3000/questions', {
+      const questionResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/questions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -157,7 +157,7 @@ export default function TabAdminModulBelajarSoal({
           formData.append('moneyNominals', JSON.stringify(item.moneyNominals));
         }
 
-        const itemResponse = await fetch('http://localhost:3000/question-items', {
+        const itemResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/question-items`, {
           method: 'POST',
           body: formData,
         });

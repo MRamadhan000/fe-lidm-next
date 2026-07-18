@@ -19,7 +19,7 @@ export default function AdminTabAkunSiswa({ onPushSystemLog }: AdminTabAkunSiswa
   const fetchStudents = async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('http://localhost:3000/users/role?role=STUDENT');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/role?role=STUDENT`);
       const data = await res.json();
       setStudents(data);
     } catch (error) {

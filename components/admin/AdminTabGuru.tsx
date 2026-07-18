@@ -18,7 +18,7 @@ export default function AdminTabAkunGuru({ onPushSystemLog }: AdminTabAkunGuruPr
   const fetchTeachers = async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('http://localhost:3000/users/role?role=TEACHER');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/role?role=TEACHER`);
       const data = await res.json();
       setTeachers(data);
     } catch (error) {

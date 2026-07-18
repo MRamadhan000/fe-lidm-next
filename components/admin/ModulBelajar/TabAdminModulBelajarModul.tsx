@@ -32,7 +32,7 @@ export default function TabAdminModulBelajarModul({
     if (!moduleTitle.trim() || !selectedLevelId) return;
 
     try {
-      await fetch('http://localhost:3000/learning-modules', {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL}/learning-modules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

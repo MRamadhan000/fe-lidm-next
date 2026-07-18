@@ -22,7 +22,7 @@ export default function LoginSiswaPage() {
 
     try {
       // 1. Fetch ke API NestJS berdasarkan username
-      const res = await fetch(`http://localhost:3000/users/username/${username}`);
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/username/${username}`);
       
       if (!res.ok) {
         if (res.status === 404) {

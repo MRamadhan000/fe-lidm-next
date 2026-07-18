@@ -19,7 +19,7 @@ export default function AdminTabKelasSLB({ onPushSystemLog }: AdminTabKelasSLBPr
   const fetchClasses = async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('http://localhost:3000/classes');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/classes`);
       const data = await res.json();
       setClassrooms(data);
     } catch (error) {
