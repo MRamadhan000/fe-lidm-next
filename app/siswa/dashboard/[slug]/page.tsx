@@ -458,7 +458,9 @@ export default function DetailKelasSiswaPageCompact() {
 
         {/* Header - Lebih Compact */}
         <div className="bg-gradient-to-br from-[#A3C49B] to-[#8DAA7B] p-4 sm:p-6 rounded-3xl text-white relative overflow-hidden">
-          <h1 className="text-xl sm:text-2xl md:text-3xl font-black pr-16 sm:pr-0">{data.class.name}</h1>
+          <h1 className="text-xl sm:text-2xl md:text-3xl font-black pr-16 sm:pr-0">
+            {data.class.name}
+          </h1>
           <p className="text-xs sm:text-sm opacity-90 font-bold mt-0.5">
             Periode: {data.class.period}
           </p>
@@ -771,7 +773,8 @@ function ItemRow({
           </p>
         ) : hasResultThisSession && result ? (
           <p className="text-red-600 font-bold mt-0.5 flex items-center gap-1">
-            <XCircle size={12} className="shrink-0" /> Belum tepat, coba lagi lewat Mulai Level
+            <XCircle size={12} className="shrink-0" /> Belum tepat, coba lagi
+            lewat Mulai Level
           </p>
         ) : (
           <p className="text-[#8DAA7B] font-bold mt-0.5 truncate">
@@ -794,6 +797,22 @@ function ItemRow({
 //   + tombol "Lanjut Sekarang" supaya siswa tetap punya kendali).
 // - Komponen ini di-remount (lewat `key={item.id}` di parent) setiap
 //   kali pindah barang, jadi semua state lokal otomatis reset bersih.
+//
+// === PERBAIKAN KAMERA (blank/hitam di foto ke-2 dst) ===
+// Root cause: kamera di-stop() lalu langsung getUserMedia() lagi tiap
+// retake / coba-lagi, dan tidak ada video.play() eksplisit. Di banyak
+// HP Android, ini bikin stream baru "hidup" tapi framenya kosong/hitam.
+//
+// Perbaikan:
+// 1. Saat retake / coba-lagi SETELAH salah, kita PAKAI ULANG stream
+//    yang sama (tidak stop+reopen), selama stream itu masih hidup.
+// 2. video.play() dipanggil eksplisit tiap kali srcObject dipasang.
+// 3. Sebelum ambil foto, kita cek video.videoWidth > 0 (frame nyata).
+//    Kalau 0 (blank), kita anggap kamera gagal → WAJIB re-request
+//    akses kamera lagi (stop stream lama, getUserMedia baru).
+// 4. Kalau reopen kamera gagal / getUserMedia() throw, tampilkan layar
+//    camera-error dengan tombol "Coba Lagi" yang juga wajib re-request
+//    kamera (bukan cuma retry pasif).
 // ============================================================
 
 type RunModalStage =
@@ -807,6 +826,9 @@ type RunModalStage =
   | "result";
 
 const RUN_AUTO_ADVANCE_MS = 3000;
+// Berapa lama kita tunggu video benar-benar mengeluarkan frame (videoWidth > 0)
+// sebelum kita anggap kamera gagal / blank dan wajib re-request akses kamera.
+const CAMERA_READY_TIMEOUT_MS = 4000;
 
 function LevelRunModal({
   runItem,
@@ -848,6 +870,13 @@ function LevelRunModal({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const advanceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cameraReadyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  // Menghindari race condition: token unik tiap kali kita mulai buka kamera.
+  // Kalau ada permintaan buka kamera yang lebih baru, hasil dari permintaan
+  // lama yang telat resolve akan diabaikan.
+  const openAttemptRef = useRef(0);
 
   const speak = (text: string) => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
@@ -861,10 +890,19 @@ function LevelRunModal({
   const speakModuleIntro = () => speak(`Modul baru, ${module.title}`);
   const speakItemName = () => speak(`Carilah benda ini, ${item.name}`);
 
+  const clearCameraReadyTimeout = () => {
+    if (cameraReadyTimeoutRef.current) {
+      clearTimeout(cameraReadyTimeoutRef.current);
+      cameraReadyTimeoutRef.current = null;
+    }
+  };
+
   // Bersihkan kamera, suara, dan timer otomatis saat item berganti / modal ditutup
   useEffect(() => {
     return () => {
+      openAttemptRef.current += 1; // batalkan attempt yang sedang berjalan
       stopCamera();
+      clearCameraReadyTimeout();
       if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
       window.speechSynthesis?.cancel();
       if (advanceTimeoutRef.current) clearTimeout(advanceTimeoutRef.current);
@@ -882,6 +920,16 @@ function LevelRunModal({
   const stopCamera = () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  };
+
+  // Cek apakah stream yang sedang dipegang masih benar-benar hidup
+  const isStreamLive = () => {
+    const stream = streamRef.current;
+    if (!stream) return false;
+    return stream.getVideoTracks().some((t) => t.readyState === "live");
   };
 
   // Dari layar module-intro -> tampilkan barang pertama di modul ini
@@ -889,7 +937,7 @@ function LevelRunModal({
     setStage("intro");
   };
 
-  // Layar intro barang -> mulai soal + buka kamera
+  // Layar intro barang -> mulai soal + buka kamera (paksa minta akses kamera baru)
   const handleBeginSearch = async () => {
     setErrorMessage(null);
     setStage("preparing");
@@ -897,7 +945,7 @@ function LevelRunModal({
     try {
       const id = await onEnsureStarted();
       setStudentQuestionItemId(id);
-      await openCamera();
+      await openCamera({ forceNew: true });
     } catch (error) {
       console.error(error);
       setErrorMessage("Belum bisa memulai soal ini. Coba lagi ya.");
@@ -905,29 +953,114 @@ function LevelRunModal({
     }
   };
 
-  const openCamera = async () => {
+  // Pasang stream ke elemen <video> dan pastikan benar-benar diputar (play()).
+  // Kalau dalam CAMERA_READY_TIMEOUT_MS video tidak pernah keluar frame
+  // (videoWidth tetap 0), kamera dianggap gagal/blank -> wajib buka ulang.
+  const attachStreamAndWaitReady = (
+    stream: MediaStream,
+    attemptId: number,
+  ): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const video = videoRef.current;
+      if (!video) {
+        reject(new Error("Video element belum siap"));
+        return;
+      }
+
+      video.srcObject = stream;
+      video.play().catch((err) => console.error("video.play() gagal:", err));
+
+      const checkReady = () => {
+        if (openAttemptRef.current !== attemptId) return; // sudah dibatalkan
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          clearCameraReadyTimeout();
+          resolve();
+        }
+      };
+
+      video.onloadedmetadata = checkReady;
+      video.onplaying = checkReady;
+
+      // Cek sekali lagi kalau-kalau event sudah lewat sebelum listener terpasang
+      checkReady();
+
+      cameraReadyTimeoutRef.current = setTimeout(() => {
+        if (openAttemptRef.current !== attemptId) return;
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          resolve();
+        } else {
+          reject(new Error("Kamera tidak mengeluarkan gambar (blank)"));
+        }
+      }, CAMERA_READY_TIMEOUT_MS);
+    });
+  };
+
+  // Buka kamera. forceNew = true akan selalu stop stream lama (jika ada)
+  // dan meminta getUserMedia() baru — ini yang dipakai saat kamera
+  // terdeteksi gagal/blank, sesuai permintaan: wajib re-request akses kamera.
+  const openCamera = async ({ forceNew }: { forceNew: boolean }) => {
+    const attemptId = ++openAttemptRef.current;
+    setErrorMessage(null);
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
-        audio: false,
-      });
-      streamRef.current = stream;
+      if (forceNew || !isStreamLive()) {
+        stopCamera();
+        // beri sedikit jeda supaya hardware kamera sempat "lepas"
+        // dari sesi sebelumnya sebelum diminta lagi
+        await new Promise((r) => setTimeout(r, 200));
+
+        if (openAttemptRef.current !== attemptId) return; // dibatalkan
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false,
+        });
+
+        if (openAttemptRef.current !== attemptId) {
+          // ada permintaan buka kamera baru yang menyusul, buang stream ini
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        streamRef.current = stream;
+      }
+
       setStage("camera");
 
-      requestAnimationFrame(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      });
+      // Tunggu frame video render dulu sebelum lanjut
+      await new Promise((r) => requestAnimationFrame(r));
+      if (openAttemptRef.current !== attemptId) return;
+
+      const stream = streamRef.current;
+      if (!stream) throw new Error("Stream kamera tidak tersedia");
+
+      await attachStreamAndWaitReady(stream, attemptId);
     } catch (error) {
-      console.error("Gagal akses kamera:", error);
+      if (openAttemptRef.current !== attemptId) return; // dibatalkan, abaikan
+      console.error("Gagal akses/menampilkan kamera:", error);
+      stopCamera();
       setStage("camera-error");
     }
+  };
+
+  // Tombol "Coba Lagi" di layar camera-error -> WAJIB minta akses kamera lagi
+  const handleRetryCameraAccess = async () => {
+    await openCamera({ forceNew: true });
   };
 
   const handleTakePhoto = () => {
     const video = videoRef.current;
     if (!video) return;
+
+    // Jaga-jaga: kalau video ternyata blank (belum ada frame nyata),
+    // jangan ambil foto hitam — paksa buka ulang akses kamera dulu.
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      setErrorMessage(
+        "Kamera tidak menampilkan gambar. Membuka ulang kamera...",
+      );
+      void openCamera({ forceNew: true });
+      return;
+    }
 
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
@@ -939,7 +1072,8 @@ function LevelRunModal({
     canvas.toBlob(
       (blob) => {
         if (!blob) return;
-        stopCamera();
+        // Stream TIDAK di-stop di sini supaya retake bisa pakai ulang
+        // stream yang sama tanpa perlu buka kamera dari nol.
         setCapturedBlob(blob);
         setCapturedPreviewUrl(URL.createObjectURL(blob));
         setStage("captured");
@@ -949,12 +1083,35 @@ function LevelRunModal({
     );
   };
 
+  // Retake: coba pakai ulang stream yang sama dulu (cepat, tidak blank).
+  // Kalau stream ternyata sudah mati / videoWidth tetap 0, otomatis
+  // fallback ke re-request akses kamera penuh lewat openCamera({forceNew:true}).
   const handleRetakePhoto = async () => {
     if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
     setCapturedPreviewUrl(null);
     setCapturedBlob(null);
-    setStage("preparing");
-    await openCamera();
+    setErrorMessage(null);
+
+    if (isStreamLive() && videoRef.current) {
+      const attemptId = ++openAttemptRef.current;
+      setStage("camera");
+      try {
+        const stream = streamRef.current!;
+        await new Promise((r) => requestAnimationFrame(r));
+        if (openAttemptRef.current !== attemptId) return;
+        await attachStreamAndWaitReady(stream, attemptId);
+        return;
+      } catch (error) {
+        if (openAttemptRef.current !== attemptId) return;
+        console.warn(
+          "Stream lama gagal dipakai ulang, buka ulang kamera:",
+          error,
+        );
+      }
+    }
+
+    // Fallback wajib: minta akses kamera baru
+    await openCamera({ forceNew: true });
   };
 
   const handleSendAnswer = async () => {
@@ -981,13 +1138,34 @@ function LevelRunModal({
     }
   };
 
+  // Coba lagi setelah jawaban salah: sama seperti retake, coba pakai ulang
+  // stream dulu, fallback wajib re-request kamera kalau gagal/blank.
   const handleTryAgainAfterWrong = async () => {
     setResult(null);
     if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
     setCapturedPreviewUrl(null);
     setCapturedBlob(null);
-    setStage("preparing");
-    await openCamera();
+    setErrorMessage(null);
+
+    if (isStreamLive() && videoRef.current) {
+      const attemptId = ++openAttemptRef.current;
+      setStage("camera");
+      try {
+        const stream = streamRef.current!;
+        await new Promise((r) => requestAnimationFrame(r));
+        if (openAttemptRef.current !== attemptId) return;
+        await attachStreamAndWaitReady(stream, attemptId);
+        return;
+      } catch (error) {
+        if (openAttemptRef.current !== attemptId) return;
+        console.warn(
+          "Stream lama gagal dipakai ulang, buka ulang kamera:",
+          error,
+        );
+      }
+    }
+
+    await openCamera({ forceNew: true });
   };
 
   const handleAdvanceNow = () => {
@@ -996,7 +1174,9 @@ function LevelRunModal({
   };
 
   const handleExitRun = () => {
+    openAttemptRef.current += 1;
     stopCamera();
+    clearCameraReadyTimeout();
     window.speechSynthesis?.cancel();
     if (advanceTimeoutRef.current) clearTimeout(advanceTimeoutRef.current);
     onClose();
@@ -1029,7 +1209,9 @@ function LevelRunModal({
             <div className="flex items-center gap-2 text-[#8DAA7B] font-black text-sm">
               <Target size={18} /> Modul Baru
             </div>
-            <p className="text-xl sm:text-2xl font-black text-[#2D332D]">{module.title}</p>
+            <p className="text-xl sm:text-2xl font-black text-[#2D332D]">
+              {module.title}
+            </p>
             {module.description && (
               <p className="text-sm text-[#6B705C] leading-relaxed">
                 {module.description}
@@ -1069,7 +1251,9 @@ function LevelRunModal({
               }
             />
 
-            <p className="text-xl sm:text-2xl font-black text-[#2D332D]">{item.name}</p>
+            <p className="text-xl sm:text-2xl font-black text-[#2D332D]">
+              {item.name}
+            </p>
             <p className="text-[10px] text-[#8DAA7B] font-bold uppercase tracking-wide">
               {question.title}
             </p>
@@ -1114,7 +1298,7 @@ function LevelRunModal({
           </div>
         )}
 
-        {/* ===== Layar: kamera gagal dibuka / izin ditolak ===== */}
+        {/* ===== Layar: kamera gagal dibuka / izin ditolak / blank ===== */}
         {stage === "camera-error" && (
           <div className="p-5 sm:p-6 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-4">
             <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center">
@@ -1125,13 +1309,18 @@ function LevelRunModal({
             </p>
             <p className="text-sm text-[#6B705C] leading-relaxed">
               Tolong minta bantuan guru atau orang tua untuk mengizinkan kamera
-              di browser ya.
+              di browser ya. Kita akan minta akses kamera lagi.
             </p>
+            {errorMessage && (
+              <p className="text-xs text-red-600 font-bold bg-red-50 border border-red-200 rounded-xl px-3 py-2 w-full">
+                {errorMessage}
+              </p>
+            )}
             <button
-              onClick={handleBeginSearch}
+              onClick={handleRetryCameraAccess}
               className="w-full flex items-center justify-center gap-2 text-base bg-[#8DAA7B] text-white px-5 py-3.5 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
             >
-              <RotateCcw size={18} /> Coba Lagi
+              <RotateCcw size={18} /> Minta Akses Kamera Lagi
             </button>
           </div>
         )}
@@ -1175,13 +1364,22 @@ function LevelRunModal({
               <X size={18} />
             </button>
 
+            {errorMessage && (
+              <p className="absolute top-20 left-3 right-3 text-xs text-white font-bold bg-red-500/90 rounded-xl px-3 py-2 text-center">
+                {errorMessage}
+              </p>
+            )}
+
             <div className="absolute bottom-6 left-0 right-0 flex flex-col items-center gap-2">
               <button
                 onClick={handleTakePhoto}
                 aria-label="Ambil foto"
                 className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-white border-4 border-[#8DAA7B] shadow-xl active:scale-95 flex items-center justify-center"
               >
-                <Camera size={26} className="sm:w-[30px] sm:h-[30px] text-[#8DAA7B]" />
+                <Camera
+                  size={26}
+                  className="sm:w-[30px] sm:h-[30px] text-[#8DAA7B]"
+                />
               </button>
               <p className="text-white text-xs font-black bg-black/40 rounded-full px-3 py-1">
                 Tekan untuk Foto
@@ -1241,7 +1439,10 @@ function LevelRunModal({
             {result.isCorrect ? (
               <>
                 <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-emerald-100 flex items-center justify-center">
-                  <CheckCircle2 size={38} className="sm:w-11 sm:h-11 text-emerald-500" />
+                  <CheckCircle2
+                    size={38}
+                    className="sm:w-11 sm:h-11 text-emerald-500"
+                  />
                 </div>
                 <p className="text-xl sm:text-2xl font-black text-emerald-600">
                   Hebat, Benar!
@@ -1274,7 +1475,10 @@ function LevelRunModal({
             ) : (
               <>
                 <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-amber-100 flex items-center justify-center">
-                  <XCircle size={38} className="sm:w-11 sm:h-11 text-amber-500" />
+                  <XCircle
+                    size={38}
+                    className="sm:w-11 sm:h-11 text-amber-500"
+                  />
                 </div>
                 <p className="text-xl sm:text-2xl font-black text-amber-600">
                   Belum Tepat
@@ -1349,7 +1553,9 @@ function LevelRunFinishedModal({
 function MiniStat({ label, value }: { label: string; value: number }) {
   return (
     <div className="bg-[#F9FBF7] border border-[#E8EEE2] rounded-lg p-1.5">
-      <p className="text-[8px] sm:text-[9px] text-[#6B705C] font-black leading-tight">{label}</p>
+      <p className="text-[8px] sm:text-[9px] text-[#6B705C] font-black leading-tight">
+        {label}
+      </p>
       <p className="text-sm font-black text-[#2D332D]">{value}</p>
     </div>
   );
