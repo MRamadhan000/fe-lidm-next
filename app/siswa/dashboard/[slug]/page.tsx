@@ -1,7 +1,7 @@
-'use client';
+"use client";
 
-import { useEffect, useRef, useState } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useEffect, useRef, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
   Loader2,
@@ -18,7 +18,8 @@ import {
   AlertTriangle,
   Send,
   Volume2,
-} from 'lucide-react';
+  SkipForward,
+} from "lucide-react";
 
 interface StudentAnswer {
   id: string;
@@ -81,7 +82,7 @@ interface SummaryNumbers {
   remainingItems: number;
 }
 
-interface LevelSummary extends Omit<SummaryNumbers, 'totalLevels'> {
+interface LevelSummary extends Omit<SummaryNumbers, "totalLevels"> {
   status: string;
 }
 
@@ -220,13 +221,61 @@ interface ItemProgressState {
   lastResult: SubmitAnswerResponse | null;
 }
 
-// Target aktif: item + level yang sedang dikerjakan lewat modal kamera
-interface ActiveTarget {
+// Satu baris antrian dalam mode "jalan otomatis 1 siklus per level"
+interface RunItem {
   lvl: DetailLevel;
+  module: DetailModule;
+  question: DetailQuestion;
   item: DetailItem;
 }
 
+// State mode jalan otomatis
+interface RunState {
+  queue: RunItem[];
+  index: number;
+  lastModuleId: string | null;
+}
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL;
+
+// Helper: tentukan apakah sebuah item sudah dijawab benar (progress sesi ini > data server)
+function isItemCorrect(
+  item: DetailItem,
+  progress: ItemProgressState | undefined,
+): boolean {
+  const result = progress?.lastResult;
+  if (result) return result.isCorrect;
+  return item.status === "COMPLETED" && Boolean(item.latestAnswer?.isCorrect);
+}
+
+// Helper: susun antrian item yang belum benar untuk satu level, urut modul -> soal -> item
+function buildRunQueue(
+  lvl: DetailLevel,
+  itemProgress: Record<string, ItemProgressState>,
+): RunItem[] {
+  const queue: RunItem[] = [];
+  const sortedModules = [...lvl.modules].sort(
+    (a, b) => a.orderNumber - b.orderNumber,
+  );
+
+  for (const module of sortedModules) {
+    const sortedQuestions = [...module.questions].sort(
+      (a, b) => a.orderNumber - b.orderNumber,
+    );
+    for (const question of sortedQuestions) {
+      const sortedItems = [...question.items].sort(
+        (a, b) => a.orderNumber - b.orderNumber,
+      );
+      for (const item of sortedItems) {
+        if (!isItemCorrect(item, itemProgress[item.id])) {
+          queue.push({ lvl, module, question, item });
+        }
+      }
+    }
+  }
+
+  return queue;
+}
 
 export default function DetailKelasSiswaPageCompact() {
   const params = useParams<{ slug: string | string[] }>();
@@ -235,21 +284,22 @@ export default function DetailKelasSiswaPageCompact() {
 
   const [data, setData] = useState<StudentDashboardDetailResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [startedQuestionIds, setStartedQuestionIds] = useState<string[]>([]);
   const [studentId, setStudentId] = useState<string | null>(null);
 
   // key = questionItemId (item.id) -> progress state item tersebut
-  const [itemProgress, setItemProgress] = useState<Record<string, ItemProgressState>>({});
+  const [itemProgress, setItemProgress] = useState<
+    Record<string, ItemProgressState>
+  >({});
 
-  // item yang sedang dibuka lewat modal "cari & foto barang"
-  const [activeTarget, setActiveTarget] = useState<ActiveTarget | null>(null);
+  // mode "jalan otomatis 1 siklus per level"
+  const [runState, setRunState] = useState<RunState | null>(null);
 
   useEffect(() => {
     if (!slug) return;
 
-    const session = localStorage.getItem('user_session');
+    const session = localStorage.getItem("user_session");
     if (!session) {
-      router.push('/login');
+      router.push("/login");
       return;
     }
 
@@ -258,12 +308,14 @@ export default function DetailKelasSiswaPageCompact() {
 
     const fetchData = async () => {
       try {
-        const res = await fetch(`${API_BASE}/student-assessments/history?userId=${userId}&classId=${slug}`);
-        if (!res.ok) throw new Error('Gagal mengambil detail kelas siswa');
+        const res = await fetch(
+          `${API_BASE}/student-assessments/history?userId=${userId}&classId=${slug}`,
+        );
+        if (!res.ok) throw new Error("Gagal mengambil detail kelas siswa");
         const result = (await res.json()) as StudentDashboardDetailResponse;
         setData(result);
       } catch (error) {
-        console.error('Gagal load history:', error);
+        console.error("Gagal load history:", error);
       } finally {
         setIsLoading(false);
       }
@@ -272,7 +324,23 @@ export default function DetailKelasSiswaPageCompact() {
     void fetchData();
   }, [slug, router]);
 
-  if (!slug) return <div className="text-center p-6 text-sm">ID kelas tidak valid.</div>;
+  // Ambil ulang data secara diam-diam (tanpa memicu spinner full-page), dipakai setelah mode jalan otomatis berhenti
+  const reloadData = async () => {
+    if (!studentId || !slug) return;
+    try {
+      const res = await fetch(
+        `${API_BASE}/student-assessments/history?userId=${studentId}&classId=${slug}`,
+      );
+      if (!res.ok) return;
+      const result = (await res.json()) as StudentDashboardDetailResponse;
+      setData(result);
+    } catch (error) {
+      console.error("Gagal refresh data:", error);
+    }
+  };
+
+  if (!slug)
+    return <div className="text-center p-6 text-sm">ID kelas tidak valid.</div>;
 
   if (isLoading) {
     return (
@@ -282,55 +350,68 @@ export default function DetailKelasSiswaPageCompact() {
     );
   }
 
-  if (!data) return <div className="text-center p-6 text-sm">Data kelas tidak ditemukan.</div>;
+  if (!data)
+    return (
+      <div className="text-center p-6 text-sm">Data kelas tidak ditemukan.</div>
+    );
 
-  const levels = [...data.levels].sort((left, right) => left.level.orderNumber - right.level.orderNumber);
-
-  const handleStartQuestion = (questionId: string) => {
-    setStartedQuestionIds((prev) => (prev.includes(questionId) ? prev : [...prev, questionId]));
-  };
+  const levels = [...data.levels].sort(
+    (left, right) => left.level.orderNumber - right.level.orderNumber,
+  );
 
   const getItemProgress = (itemId: string): ItemProgressState => {
-    return itemProgress[itemId] ?? { studentQuestionItemId: null, lastResult: null };
+    return (
+      itemProgress[itemId] ?? { studentQuestionItemId: null, lastResult: null }
+    );
   };
 
   // === Panggil API /student-assessments/start, kembalikan studentQuestionItemId ===
-  const ensureStarted = async (lvl: DetailLevel, item: DetailItem): Promise<string> => {
+  const ensureStarted = async (
+    lvl: DetailLevel,
+    item: DetailItem,
+  ): Promise<string> => {
     const existing = getItemProgress(item.id).studentQuestionItemId;
     if (existing) return existing;
-    if (!studentId) throw new Error('Sesi siswa tidak ditemukan.');
+    if (!studentId) throw new Error("Sesi siswa tidak ditemukan.");
 
     const res = await fetch(`${API_BASE}/student-assessments/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         studentId,
         classLevelId: lvl.classLevelId,
         questionItemId: item.id,
       }),
     });
-    if (!res.ok) throw new Error('Gagal memulai pengerjaan item');
+    if (!res.ok) throw new Error("Gagal memulai pengerjaan item");
 
     const result = (await res.json()) as StartAnswerResponse;
 
     setItemProgress((prev) => ({
       ...prev,
-      [item.id]: { ...getItemProgress(item.id), studentQuestionItemId: result.id },
+      [item.id]: {
+        ...getItemProgress(item.id),
+        studentQuestionItemId: result.id,
+      },
     }));
 
     return result.id;
   };
 
   // === Panggil API submit foto jawaban ===
-  const submitPhoto = async (item: DetailItem, studentQuestionItemId: string, blob: Blob): Promise<SubmitAnswerResponse> => {
+  const submitPhoto = async (
+    item: DetailItem,
+    studentQuestionItemId: string,
+    blob: Blob,
+  ): Promise<SubmitAnswerResponse> => {
     const formData = new FormData();
-    formData.append('file', blob, 'jawaban.jpg');
+    formData.append("file", blob, "jawaban.jpg");
 
     const res = await fetch(
       `${API_BASE}/student-assessments/${studentQuestionItemId}/item/${item.id}/submit`,
-      { method: 'POST', body: formData },
+      { method: "POST", body: formData },
     );
-    if (!res.ok) throw new Error('Gagal mengirim jawaban');
+    if (!res.ok) throw new Error("Gagal mengirim jawaban");
 
     const result = (await res.json()) as SubmitAnswerResponse;
 
@@ -342,90 +423,166 @@ export default function DetailKelasSiswaPageCompact() {
     return result;
   };
 
+  // === Mode jalan otomatis: mulai 1 siklus penuh untuk sebuah level ===
+  const handleStartLevelRun = (lvl: DetailLevel) => {
+    if (lvl.isLocked) return;
+    const queue = buildRunQueue(lvl, itemProgress);
+    if (queue.length === 0) return;
+    setRunState({ queue, index: 0, lastModuleId: null });
+  };
+
+  // Lanjut ke item berikutnya dalam antrian (dipanggil setelah jawaban benar)
+  const handleRunAdvance = (finishedModuleId: string) => {
+    setRunState((prev) => {
+      if (!prev) return prev;
+      return { ...prev, index: prev.index + 1, lastModuleId: finishedModuleId };
+    });
+  };
+
+  // Keluar dari mode jalan otomatis (baik selesai maupun dihentikan siswa/guru)
+  const handleRunClose = () => {
+    setRunState(null);
+    void reloadData();
+  };
+
   return (
     <main className="min-h-screen bg-[#FDFBF7] p-3 sm:p-4 md:p-6 font-sans">
-      <div className="max-w-6xl mx-auto space-y-5">
-
+      <div className="max-w-6xl mx-auto space-y-4 sm:space-y-5">
         {/* Back Button - Lebih Kecil */}
         <button
           onClick={() => router.back()}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-white rounded-2xl border border-[#DDE2D8] text-[#6B705C] text-sm font-bold hover:bg-[#F5F7F2]"
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-white rounded-2xl border border-[#DDE2D8] text-[#6B705C] text-sm font-bold hover:bg-[#F5F7F2] active:bg-[#F5F7F2]"
         >
           <ArrowLeft size={16} /> Kembali
         </button>
 
         {/* Header - Lebih Compact */}
-        <div className="bg-gradient-to-br from-[#A3C49B] to-[#8DAA7B] p-5 sm:p-6 rounded-3xl text-white relative overflow-hidden">
-          <h1 className="text-2xl sm:text-3xl font-black">{data.class.name}</h1>
-          <p className="text-sm opacity-90 font-bold mt-0.5">Periode: {data.class.period}</p>
-          <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-white/20 px-3 py-1 text-xs font-bold">
-            <User size={13} /> {data.student.fullName} ({data.student.username})
+        <div className="bg-gradient-to-br from-[#A3C49B] to-[#8DAA7B] p-4 sm:p-6 rounded-3xl text-white relative overflow-hidden">
+          <h1 className="text-xl sm:text-2xl md:text-3xl font-black pr-16 sm:pr-0">{data.class.name}</h1>
+          <p className="text-xs sm:text-sm opacity-90 font-bold mt-0.5">
+            Periode: {data.class.period}
+          </p>
+          <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-white/20 px-3 py-1 text-[11px] sm:text-xs font-bold max-w-full">
+            <User size={13} className="shrink-0" />{" "}
+            <span className="truncate">
+              {data.student.fullName} ({data.student.username})
+            </span>
           </div>
-          <Trophy className="absolute -right-3 -bottom-3 text-white/20 w-24 h-24" />
+          <Trophy className="absolute -right-3 -bottom-3 text-white/20 w-16 h-16 sm:w-24 sm:h-24" />
         </div>
 
         {/* Summary Stats - Lebih Kecil & Rapat */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-2.5">
           {[
-            { label: 'Total Level', val: data.summary.totalLevels },
-            { label: 'Total Modul', val: data.summary.totalModules },
-            { label: 'Total Soal', val: data.summary.totalQuestions },
-            { label: 'Soal Selesai', val: data.summary.completedQuestions },
-            { label: 'Soal Progress', val: data.summary.inProgressQuestions },
-            { label: 'Soal Belum', val: data.summary.notStartedQuestions },
-            { label: 'Total Item', val: data.summary.totalItems },
-            { label: 'Item Terjawab', val: data.summary.answeredItems },
-            { label: 'Item Progress', val: data.summary.inProgressItems },
-            { label: 'Item Belum', val: data.summary.notStartedItems },
-            { label: 'Total Submit', val: data.summary.totalSubmissions },
-            { label: 'Sisa Item', val: data.summary.remainingItems },
+            { label: "Total Level", val: data.summary.totalLevels },
+            { label: "Total Modul", val: data.summary.totalModules },
+            { label: "Total Soal", val: data.summary.totalQuestions },
+            { label: "Soal Selesai", val: data.summary.completedQuestions },
+            { label: "Soal Progress", val: data.summary.inProgressQuestions },
+            { label: "Soal Belum", val: data.summary.notStartedQuestions },
+            { label: "Total Item", val: data.summary.totalItems },
+            { label: "Item Terjawab", val: data.summary.answeredItems },
+            { label: "Item Progress", val: data.summary.inProgressItems },
+            { label: "Item Belum", val: data.summary.notStartedItems },
+            { label: "Total Submit", val: data.summary.totalSubmissions },
+            { label: "Sisa Item", val: data.summary.remainingItems },
           ].map((item, i) => (
-            <div key={i} className="bg-white p-3 rounded-2xl border border-[#E8ECE4] flex items-center gap-3">
-              <div className="text-[#8DAA7B]">
-                <Target size={18} />
+            <div
+              key={i}
+              className="bg-white p-2.5 sm:p-3 rounded-2xl border border-[#E8ECE4] flex items-center gap-2 sm:gap-3 min-w-0"
+            >
+              <div className="text-[#8DAA7B] shrink-0">
+                <Target size={16} className="sm:w-[18px] sm:h-[18px]" />
               </div>
-              <div>
-                <p className="text-[10px] font-black text-[#6B705C]">{item.label}</p>
-                <p className="text-xl font-black text-[#2D332D] leading-none mt-0.5">{item.val}</p>
+              <div className="min-w-0">
+                <p className="text-[9px] sm:text-[10px] font-black text-[#6B705C] truncate">
+                  {item.label}
+                </p>
+                <p className="text-lg sm:text-xl font-black text-[#2D332D] leading-none mt-0.5">
+                  {item.val}
+                </p>
               </div>
             </div>
           ))}
         </div>
 
         {/* Detail Progres Belajar */}
-        <div className="space-y-4">
-          <h2 className="text-lg font-black text-[#2D332D] px-1">Detail Progres Belajar</h2>
+        <div className="space-y-3 sm:space-y-4">
+          <h2 className="text-base sm:text-lg font-black text-[#2D332D] px-1">
+            Detail Progres Belajar
+          </h2>
 
           {levels.map((lvl) => (
             <div
               key={lvl.classLevelId}
-              className={`bg-white rounded-3xl border p-4 space-y-4 ${lvl.isLocked ? 'opacity-60 border-[#E8ECE4]' : 'border-[#DDE2D8]'}`}
+              className={`bg-white rounded-3xl border p-3 sm:p-4 space-y-3 sm:space-y-4 ${lvl.isLocked ? "opacity-60 border-[#E8ECE4]" : "border-[#DDE2D8]"}`}
             >
               {/* Level Header */}
-              <div className="flex justify-between items-start gap-3">
-                <div>
-                  <h3 className="font-black text-lg text-[#2D332D]">{lvl.level.name}</h3>
-                  <p className="text-xs text-[#6B705C] mt-0.5">{lvl.level.description}</p>
+              <div className="flex flex-col sm:flex-row justify-between items-start gap-3">
+                <div className="min-w-0">
+                  <h3 className="font-black text-base sm:text-lg text-[#2D332D]">
+                    {lvl.level.name}
+                  </h3>
+                  <p className="text-xs text-[#6B705C] mt-0.5">
+                    {lvl.level.description}
+                  </p>
                   <p className="text-[10px] text-[#8DAA7B] font-bold mt-1">
-                    Urutan {lvl.level.orderNumber} · Bobot {lvl.level.weight} · {lvl.summary.totalModules} Modul · {lvl.summary.totalQuestions} Soal
+                    Urutan {lvl.level.orderNumber} · Bobot {lvl.level.weight} ·{" "}
+                    {lvl.summary.totalModules} Modul ·{" "}
+                    {lvl.summary.totalQuestions} Soal
                   </p>
                 </div>
-                <StatusBadge status={lvl.summary.status} />
+                <div className="flex flex-row sm:flex-col items-center sm:items-end gap-1.5 shrink-0 w-full sm:w-auto justify-between sm:justify-start">
+                  <StatusBadge status={lvl.summary.status} />
+                  {!lvl.isLocked && lvl.summary.remainingItems > 0 && (
+                    <button
+                      onClick={() => handleStartLevelRun(lvl)}
+                      className="flex items-center gap-1 text-xs bg-[#8DAA7B] text-white px-2.5 py-1.5 rounded-lg font-bold active:bg-[#6f8a63] shadow whitespace-nowrap"
+                    >
+                      <PlayCircle size={13} /> Mulai Level
+                    </button>
+                  )}
+                </div>
               </div>
 
               {/* Level Stats - Lebih Kecil */}
-              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5 sm:gap-2">
                 {[
-                  { label: 'Modul Selesai', value: lvl.summary.completedModules },
-                  { label: 'Modul Progress', value: lvl.summary.inProgressModules },
-                  { label: 'Modul Belum', value: lvl.summary.notStartedModules },
-                  { label: 'Soal Selesai', value: lvl.summary.completedQuestions },
-                  { label: 'Soal Progress', value: lvl.summary.inProgressQuestions },
-                  { label: 'Soal Belum', value: lvl.summary.notStartedQuestions },
+                  {
+                    label: "Modul Selesai",
+                    value: lvl.summary.completedModules,
+                  },
+                  {
+                    label: "Modul Progress",
+                    value: lvl.summary.inProgressModules,
+                  },
+                  {
+                    label: "Modul Belum",
+                    value: lvl.summary.notStartedModules,
+                  },
+                  {
+                    label: "Soal Selesai",
+                    value: lvl.summary.completedQuestions,
+                  },
+                  {
+                    label: "Soal Progress",
+                    value: lvl.summary.inProgressQuestions,
+                  },
+                  {
+                    label: "Soal Belum",
+                    value: lvl.summary.notStartedQuestions,
+                  },
                 ].map((stat, idx) => (
-                  <div key={idx} className="bg-[#F9FBF7] border border-[#E8EEE2] rounded-xl p-2 text-center">
-                    <p className="text-[9px] text-[#6B705C] font-black">{stat.label}</p>
-                    <p className="text-base font-black text-[#2D332D]">{stat.value}</p>
+                  <div
+                    key={idx}
+                    className="bg-[#F9FBF7] border border-[#E8EEE2] rounded-xl p-1.5 sm:p-2 text-center"
+                  >
+                    <p className="text-[8px] sm:text-[9px] text-[#6B705C] font-black leading-tight">
+                      {stat.label}
+                    </p>
+                    <p className="text-sm sm:text-base font-black text-[#2D332D]">
+                      {stat.value}
+                    </p>
                   </div>
                 ))}
               </div>
@@ -438,215 +595,287 @@ export default function DetailKelasSiswaPageCompact() {
                   </div>
                 )}
 
-                {[...lvl.modules].sort((a, b) => a.orderNumber - b.orderNumber).map((module) => (
-                  <div key={module.id} className="border border-[#DDE2D8] rounded-2xl p-3 bg-[#FCFDFB]">
-                    <div className="flex justify-between items-start gap-2">
-                      <div>
-                        <h4 className="font-black text-base text-[#2D332D]">{module.title}</h4>
-                        <p className="text-xs text-[#6B705C] mt-0.5">{module.description}</p>
-                        <p className="text-[10px] text-[#8DAA7B] font-bold mt-1">
-                          Urutan {module.orderNumber} · {module.summary.totalQuestions} Soal · {module.summary.totalItems} Item
-                        </p>
-                      </div>
-                      <StatusBadge status={module.summary.status} />
-                    </div>
-
-                    {/* Questions inside Module */}
-                    <div className="mt-3 space-y-3">
-                      {module.questions.length === 0 && (
-                        <div className="text-xs text-[#6B705C] border border-dashed border-[#DDE2D8] rounded-xl p-3">
-                          Modul ini belum memiliki soal.
+                {[...lvl.modules]
+                  .sort((a, b) => a.orderNumber - b.orderNumber)
+                  .map((module) => (
+                    <div
+                      key={module.id}
+                      className="border border-[#DDE2D8] rounded-2xl p-2.5 sm:p-3 bg-[#FCFDFB]"
+                    >
+                      <div className="flex justify-between items-start gap-2">
+                        <div className="min-w-0">
+                          <h4 className="font-black text-sm sm:text-base text-[#2D332D]">
+                            {module.title}
+                          </h4>
+                          <p className="text-xs text-[#6B705C] mt-0.5">
+                            {module.description}
+                          </p>
+                          <p className="text-[10px] text-[#8DAA7B] font-bold mt-1">
+                            Urutan {module.orderNumber} ·{" "}
+                            {module.summary.totalQuestions} Soal ·{" "}
+                            {module.summary.totalItems} Item
+                          </p>
                         </div>
-                      )}
+                        <div className="shrink-0">
+                          <StatusBadge status={module.summary.status} />
+                        </div>
+                      </div>
 
-                      {[...module.questions].sort((a, b) => a.orderNumber - b.orderNumber).map((q) => {
-                        const isNotStarted = q.status === 'NOT_STARTED' && !startedQuestionIds.includes(q.id);
-                        const visibleStatus = isNotStarted ? 'NOT_STARTED' : q.status;
-
-                        return (
-                          <div key={q.id} className="bg-white border border-[#E4EADF] rounded-2xl p-3 space-y-2.5">
-                            <div className="flex justify-between gap-2">
-                              <div className="min-w-0">
-                                <p className="font-bold text-sm text-[#2D332D]">{q.title}</p>
-                                <p className="text-[10px] text-[#6B705C] mt-0.5 line-clamp-1">{q.instruction}</p>
-                                <p className="text-[10px] text-[#8DAA7B] font-bold mt-1">
-                                  {q.items.length} Item · {q.totalSubmissions} Submit · {q.remainingItems} Sisa
-                                </p>
-                              </div>
-                              <div className="flex flex-col items-end gap-1.5 shrink-0">
-                                <StatusBadge status={visibleStatus} />
-                                {isNotStarted && (
-                                  <button
-                                    onClick={() => handleStartQuestion(q.id)}
-                                    className="flex items-center gap-1 text-xs bg-[#8DAA7B] text-white px-2.5 py-1 rounded-lg font-bold active:bg-[#6f8a63]"
-                                  >
-                                    <PlayCircle size={13} /> Start
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-
-                            {/* Item Stats */}
-                            <div className="grid grid-cols-4 gap-1.5 text-center">
-                              <MiniStat label="Answered" value={q.answeredItems} />
-                              <MiniStat label="Completed" value={q.completedItems} />
-                              <MiniStat label="Progress" value={q.inProgressItems} />
-                              <MiniStat label="Belum" value={q.notStartedItems} />
-                            </div>
-
-                            {/* Items List */}
-                            {q.items.length > 0 && (
-                              <div className="space-y-2 pt-1">
-                                {q.items.map((item) => (
-                                  <ItemRow
-                                    key={item.id}
-                                    item={item}
-                                    progress={getItemProgress(item.id)}
-                                    locked={lvl.isLocked}
-                                    onOpen={() => setActiveTarget({ lvl, item })}
-                                  />
-                                ))}
-                              </div>
-                            )}
+                      {/* Questions inside Module */}
+                      <div className="mt-3 space-y-3">
+                        {module.questions.length === 0 && (
+                          <div className="text-xs text-[#6B705C] border border-dashed border-[#DDE2D8] rounded-xl p-3">
+                            Modul ini belum memiliki soal.
                           </div>
-                        );
-                      })}
+                        )}
+
+                        {[...module.questions]
+                          .sort((a, b) => a.orderNumber - b.orderNumber)
+                          .map((q) => (
+                            <div
+                              key={q.id}
+                              className="bg-white border border-[#E4EADF] rounded-2xl p-2.5 sm:p-3 space-y-2.5"
+                            >
+                              <div className="flex justify-between gap-2">
+                                <div className="min-w-0">
+                                  <p className="font-bold text-sm text-[#2D332D]">
+                                    {q.title}
+                                  </p>
+                                  <p className="text-[10px] text-[#6B705C] mt-0.5 line-clamp-1">
+                                    {q.instruction}
+                                  </p>
+                                  <p className="text-[10px] text-[#8DAA7B] font-bold mt-1">
+                                    {q.items.length} Item · {q.totalSubmissions}{" "}
+                                    Submit · {q.remainingItems} Sisa
+                                  </p>
+                                </div>
+                                <div className="shrink-0">
+                                  <StatusBadge status={q.status} />
+                                </div>
+                              </div>
+
+                              {/* Item Stats */}
+                              <div className="grid grid-cols-2 xs:grid-cols-4 sm:grid-cols-4 gap-1.5 text-center">
+                                <MiniStat
+                                  label="Answered"
+                                  value={q.answeredItems}
+                                />
+                                <MiniStat
+                                  label="Completed"
+                                  value={q.completedItems}
+                                />
+                                <MiniStat
+                                  label="Progress"
+                                  value={q.inProgressItems}
+                                />
+                                <MiniStat
+                                  label="Belum"
+                                  value={q.notStartedItems}
+                                />
+                              </div>
+
+                              {/* Items List */}
+                              {q.items.length > 0 && (
+                                <div className="space-y-2 pt-1">
+                                  {q.items.map((item) => (
+                                    <ItemRow
+                                      key={item.id}
+                                      item={item}
+                                      progress={getItemProgress(item.id)}
+                                    />
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
               </div>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Modal cari & foto barang */}
-      {activeTarget && (
-        <FindAndCaptureModal
-          item={activeTarget.item}
-          onClose={() => setActiveTarget(null)}
-          onEnsureStarted={() => ensureStarted(activeTarget.lvl, activeTarget.item)}
-          onSubmitPhoto={(studentQuestionItemId, blob) => submitPhoto(activeTarget.item, studentQuestionItemId, blob)}
+      {/* Mode jalan otomatis 1 siklus per level */}
+      {runState && runState.index < runState.queue.length && (
+        <LevelRunModal
+          key={runState.queue[runState.index].item.id}
+          runItem={runState.queue[runState.index]}
+          position={runState.index + 1}
+          total={runState.queue.length}
+          moduleChanged={
+            runState.lastModuleId !== runState.queue[runState.index].module.id
+          }
+          onClose={handleRunClose}
+          onEnsureStarted={() =>
+            ensureStarted(
+              runState.queue[runState.index].lvl,
+              runState.queue[runState.index].item,
+            )
+          }
+          onSubmitPhoto={(studentQuestionItemId, blob) =>
+            submitPhoto(
+              runState.queue[runState.index].item,
+              studentQuestionItemId,
+              blob,
+            )
+          }
+          onAdvance={() =>
+            handleRunAdvance(runState.queue[runState.index].module.id)
+          }
+        />
+      )}
+
+      {runState && runState.index >= runState.queue.length && (
+        <LevelRunFinishedModal
+          totalCompleted={runState.queue.length}
+          onClose={handleRunClose}
         />
       )}
     </main>
   );
 }
 
-// ==== Baris ringkas tiap barang di dalam daftar soal ====
+// ==== Baris ringkas tiap barang di dalam daftar soal (tampilan status saja) ====
+// Pengerjaan sekarang dijalankan lewat mode "Mulai Level" (LevelRunModal),
+// jadi baris ini murni menampilkan status, tanpa tombol aksi per item.
 function ItemRow({
   item,
   progress,
-  locked,
-  onOpen,
 }: {
   item: DetailItem;
   progress: ItemProgressState;
-  locked: boolean;
-  onOpen: () => void;
 }) {
   const result = progress.lastResult;
-  const isCorrectNow = result ? result.isCorrect : item.status === 'COMPLETED' && item.latestAnswer?.isCorrect;
+  const isCorrectNow = result
+    ? result.isCorrect
+    : item.status === "COMPLETED" && item.latestAnswer?.isCorrect;
   const hasResultThisSession = result !== null;
 
   return (
-    <div className="flex gap-3 bg-[#F9FBF7] border border-[#ECF1E8] rounded-xl p-2.5 items-center">
+    <div className="flex gap-2.5 sm:gap-3 bg-[#F9FBF7] border border-[#ECF1E8] rounded-xl p-2 sm:p-2.5 items-center">
       <div
-        className="w-11 h-11 rounded-lg bg-cover bg-center border border-[#DDE2D8] shrink-0"
+        className="w-10 h-10 sm:w-11 sm:h-11 rounded-lg bg-cover bg-center border border-[#DDE2D8] shrink-0"
         style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
       />
       <div className="min-w-0 flex-1 text-xs">
         <p className="font-bold text-[#2D332D] truncate">{item.name}</p>
-        <p className="text-[#6B705C] mt-0.5">
+        <p className="text-[#6B705C] mt-0.5 truncate">
           Rp{item.price} · Qty {item.quantity} · Bobot {item.weight}
         </p>
         {isCorrectNow ? (
           <p className="text-emerald-600 font-bold mt-0.5 flex items-center gap-1">
-            <CheckCircle2 size={12} /> Benar{hasResultThisSession && result ? ` · Skor ${result.score}` : ''}
+            <CheckCircle2 size={12} className="shrink-0" /> Benar
+            {hasResultThisSession && result ? ` · Skor ${result.score}` : ""}
           </p>
         ) : hasResultThisSession && result ? (
           <p className="text-red-600 font-bold mt-0.5 flex items-center gap-1">
-            <XCircle size={12} /> Belum tepat, coba lagi
+            <XCircle size={12} className="shrink-0" /> Belum tepat, coba lagi lewat Mulai Level
           </p>
         ) : (
-          <p className="text-[#8DAA7B] font-bold mt-0.5">
+          <p className="text-[#8DAA7B] font-bold mt-0.5 truncate">
             {item.status} · {item.answerCount} jawaban
           </p>
         )}
       </div>
-
-      {!isCorrectNow && (
-        <button
-          onClick={onOpen}
-          disabled={locked}
-          className="shrink-0 flex items-center gap-1.5 text-xs bg-[#8DAA7B] text-white px-3 py-2 rounded-xl font-bold active:bg-[#6f8a63] disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <Camera size={15} />
-          {hasResultThisSession ? 'Foto Lagi' : 'Mulai'}
-        </button>
-      )}
     </div>
   );
 }
 
 // ============================================================
-// Modal: cari barang -> izinkan kamera -> foto -> kirim jawaban
-// Dirancang sederhana & ramah untuk anak tunagrahita:
-// - satu langkah jelas per layar
-// - teks pendek, kalimat sederhana
-// - tombol besar dengan ikon + tulisan (bukan ikon saja)
-// - warna & ikon dipakai bersamaan sebagai penanda benar/salah
-// - nama barang juga dibacakan otomatis lewat text-to-speech (Web Speech API)
+// LevelRunModal: mode "jalan otomatis 1 siklus per level"
+// - Siswa klik "Mulai Level" sekali di daftar level.
+// - Tiap kali pindah ke modul yang berbeda dari modul sebelumnya,
+//   siswa harus klik "Mulai Modul Ini" dulu (layar module-intro),
+//   supaya siswa sadar sedang masuk bagian baru.
+// - Di dalam modul yang sama, setelah jawaban benar, aplikasi akan
+//   otomatis lanjut ke barang berikutnya (dengan hitung mundur singkat
+//   + tombol "Lanjut Sekarang" supaya siswa tetap punya kendali).
+// - Komponen ini di-remount (lewat `key={item.id}` di parent) setiap
+//   kali pindah barang, jadi semua state lokal otomatis reset bersih.
 // ============================================================
 
-type ModalStage = 'intro' | 'preparing' | 'camera' | 'camera-error' | 'captured' | 'submitting' | 'result';
+type RunModalStage =
+  | "module-intro"
+  | "intro"
+  | "preparing"
+  | "camera"
+  | "camera-error"
+  | "captured"
+  | "submitting"
+  | "result";
 
-function FindAndCaptureModal({
-  item,
+const RUN_AUTO_ADVANCE_MS = 3000;
+
+function LevelRunModal({
+  runItem,
+  position,
+  total,
+  moduleChanged,
   onClose,
   onEnsureStarted,
   onSubmitPhoto,
+  onAdvance,
 }: {
-  item: DetailItem;
+  runItem: RunItem;
+  position: number;
+  total: number;
+  moduleChanged: boolean;
   onClose: () => void;
   onEnsureStarted: () => Promise<string>;
-  onSubmitPhoto: (studentQuestionItemId: string, blob: Blob) => Promise<SubmitAnswerResponse>;
+  onSubmitPhoto: (
+    studentQuestionItemId: string,
+    blob: Blob,
+  ) => Promise<SubmitAnswerResponse>;
+  onAdvance: () => void;
 }) {
-  const [stage, setStage] = useState<ModalStage>('intro');
+  const { module, question, item } = runItem;
+
+  const [stage, setStage] = useState<RunModalStage>(
+    moduleChanged ? "module-intro" : "intro",
+  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [capturedPreviewUrl, setCapturedPreviewUrl] = useState<string | null>(null);
+  const [capturedPreviewUrl, setCapturedPreviewUrl] = useState<string | null>(
+    null,
+  );
   const [capturedBlob, setCapturedBlob] = useState<Blob | null>(null);
   const [result, setResult] = useState<SubmitAnswerResponse | null>(null);
-  const [studentQuestionItemId, setStudentQuestionItemId] = useState<string | null>(null);
+  const [studentQuestionItemId, setStudentQuestionItemId] = useState<
+    string | null
+  >(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const advanceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // === Text-to-speech: ucapkan nama barang yang harus dicari ===
-  const speakItemName = () => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return;
-    window.speechSynthesis.cancel(); // hentikan suara sebelumnya kalau masih ngomong
-    const utterance = new SpeechSynthesisUtterance(`Carilah benda ini, ${item.name}`);
-    utterance.lang = 'id-ID';
+  const speak = (text: string) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "id-ID";
     utterance.rate = 0.9;
     window.speechSynthesis.speak(utterance);
   };
 
-  // Selalu matikan kamera & suara saat modal ditutup / komponen dilepas
+  const speakModuleIntro = () => speak(`Modul baru, ${module.title}`);
+  const speakItemName = () => speak(`Carilah benda ini, ${item.name}`);
+
+  // Bersihkan kamera, suara, dan timer otomatis saat item berganti / modal ditutup
   useEffect(() => {
     return () => {
       stopCamera();
       if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
       window.speechSynthesis?.cancel();
+      if (advanceTimeoutRef.current) clearTimeout(advanceTimeoutRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Otomatis ucapkan nama barang setiap kali layar intro tampil
+  // Ucapkan otomatis sesuai layar yang sedang tampil
   useEffect(() => {
-    if (stage === 'intro') {
-      speakItemName();
-    }
+    if (stage === "module-intro") speakModuleIntro();
+    if (stage === "intro") speakItemName();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage]);
 
@@ -655,10 +884,15 @@ function FindAndCaptureModal({
     streamRef.current = null;
   };
 
-  // Langkah 1: siswa klik "Ayo, Mulai!" di layar intro
+  // Dari layar module-intro -> tampilkan barang pertama di modul ini
+  const handleBeginModule = () => {
+    setStage("intro");
+  };
+
+  // Layar intro barang -> mulai soal + buka kamera
   const handleBeginSearch = async () => {
     setErrorMessage(null);
-    setStage('preparing');
+    setStage("preparing");
 
     try {
       const id = await onEnsureStarted();
@@ -666,41 +900,39 @@ function FindAndCaptureModal({
       await openCamera();
     } catch (error) {
       console.error(error);
-      setErrorMessage('Belum bisa memulai soal ini. Coba lagi ya.');
-      setStage('intro');
+      setErrorMessage("Belum bisa memulai soal ini. Coba lagi ya.");
+      setStage("intro");
     }
   };
 
   const openCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
+        video: { facingMode: "environment" },
         audio: false,
       });
       streamRef.current = stream;
-      setStage('camera');
+      setStage("camera");
 
-      // videoRef baru terpasang setelah render, tunggu sebentar lalu attach stream
       requestAnimationFrame(() => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
       });
     } catch (error) {
-      console.error('Gagal akses kamera:', error);
-      setStage('camera-error');
+      console.error("Gagal akses kamera:", error);
+      setStage("camera-error");
     }
   };
 
-  // Langkah 2: siswa tekan tombol bulat besar untuk memotret
   const handleTakePhoto = () => {
     const video = videoRef.current;
     if (!video) return;
 
-    const canvas = document.createElement('canvas');
+    const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
@@ -710,83 +942,137 @@ function FindAndCaptureModal({
         stopCamera();
         setCapturedBlob(blob);
         setCapturedPreviewUrl(URL.createObjectURL(blob));
-        setStage('captured');
+        setStage("captured");
       },
-      'image/jpeg',
+      "image/jpeg",
       0.9,
     );
   };
 
-  // Ambil ulang foto: buka kamera lagi
   const handleRetakePhoto = async () => {
     if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
     setCapturedPreviewUrl(null);
     setCapturedBlob(null);
-    setStage('preparing');
+    setStage("preparing");
     await openCamera();
   };
 
-  // Langkah 3: kirim jawaban
   const handleSendAnswer = async () => {
     if (!studentQuestionItemId || !capturedBlob) return;
     setErrorMessage(null);
-    setStage('submitting');
+    setStage("submitting");
 
     try {
       const res = await onSubmitPhoto(studentQuestionItemId, capturedBlob);
       setResult(res);
-      setStage('result');
+      setStage("result");
+
+      if (res.isCorrect) {
+        // Otomatis lanjut ke barang berikutnya setelah beberapa detik,
+        // tapi siswa tetap bisa menekan "Lanjut Sekarang" kapan saja.
+        advanceTimeoutRef.current = setTimeout(() => {
+          onAdvance();
+        }, RUN_AUTO_ADVANCE_MS);
+      }
     } catch (error) {
       console.error(error);
-      setErrorMessage('Jawaban gagal dikirim. Coba kirim lagi ya.');
-      setStage('captured');
+      setErrorMessage("Jawaban gagal dikirim. Coba kirim lagi ya.");
+      setStage("captured");
     }
   };
 
-  // Coba lagi setelah jawaban salah: langsung buka kamera lagi
   const handleTryAgainAfterWrong = async () => {
     setResult(null);
     if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
     setCapturedPreviewUrl(null);
     setCapturedBlob(null);
-    setStage('preparing');
+    setStage("preparing");
     await openCamera();
   };
 
-  const handleCloseModal = () => {
+  const handleAdvanceNow = () => {
+    if (advanceTimeoutRef.current) clearTimeout(advanceTimeoutRef.current);
+    onAdvance();
+  };
+
+  const handleExitRun = () => {
     stopCamera();
     window.speechSynthesis?.cancel();
+    if (advanceTimeoutRef.current) clearTimeout(advanceTimeoutRef.current);
     onClose();
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3">
-      <div className="bg-[#FDFBF7] w-full max-w-md rounded-3xl overflow-hidden shadow-2xl relative max-h-[92vh] flex flex-col">
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-0 sm:p-3">
+      <div className="bg-[#FDFBF7] w-full h-full sm:h-auto sm:max-w-md rounded-none sm:rounded-3xl overflow-hidden shadow-2xl relative max-h-screen sm:max-h-[92vh] flex flex-col">
+        {/* Indikator progres "Soal X dari Y" */}
+        {stage !== "camera" && (
+          <div className="absolute top-3 left-3 z-10 bg-[#2D332D]/85 text-white text-[10px] font-black px-2.5 py-1 rounded-full">
+            Soal {position} / {total}
+          </div>
+        )}
 
-        {/* Tombol tutup - selalu ada, besar & jelas */}
-        {stage !== 'camera' && (
+        {/* Tombol keluar dari mode jalan otomatis - selalu ada kecuali saat kamera aktif */}
+        {stage !== "camera" && (
           <button
-            onClick={handleCloseModal}
-            aria-label="Tutup"
+            onClick={handleExitRun}
+            aria-label="Keluar dari mode berjalan"
             className="absolute top-3 right-3 z-10 bg-white/90 hover:bg-white text-[#2D332D] rounded-full p-2 shadow-md"
           >
             <X size={20} />
           </button>
         )}
 
-        {/* ===== Layar 1: Perkenalan barang yang harus dicari ===== */}
-        {stage === 'intro' && (
-          <div className="p-6 flex flex-col items-center text-center gap-4">
+        {/* ===== Layar: perkenalan modul baru (hanya muncul saat pindah modul) ===== */}
+        {stage === "module-intro" && (
+          <div className="p-5 sm:p-6 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-4 overflow-y-auto">
+            <div className="flex items-center gap-2 text-[#8DAA7B] font-black text-sm">
+              <Target size={18} /> Modul Baru
+            </div>
+            <p className="text-xl sm:text-2xl font-black text-[#2D332D]">{module.title}</p>
+            {module.description && (
+              <p className="text-sm text-[#6B705C] leading-relaxed">
+                {module.description}
+              </p>
+            )}
+
+            <button
+              onClick={speakModuleIntro}
+              aria-label="Dengarkan nama modul"
+              className="flex items-center gap-1.5 text-xs bg-[#8DAA7B]/10 text-[#6f8a63] px-3 py-1.5 rounded-full font-bold active:bg-[#8DAA7B]/20"
+            >
+              <Volume2 size={14} /> Dengar Lagi
+            </button>
+
+            <button
+              onClick={handleBeginModule}
+              className="w-full flex items-center justify-center gap-2 text-base sm:text-lg bg-[#8DAA7B] text-white px-5 py-3.5 sm:py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+            >
+              <PlayCircle size={22} /> Mulai Modul Ini
+            </button>
+          </div>
+        )}
+
+        {/* ===== Layar: perkenalan barang yang harus dicari ===== */}
+        {stage === "intro" && (
+          <div className="p-5 sm:p-6 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-3 sm:gap-4 overflow-y-auto">
             <div className="flex items-center gap-2 text-[#8DAA7B] font-black text-sm">
               <Search size={18} /> Ayo Cari Barang Ini!
             </div>
 
             <div
-              className="w-48 h-48 rounded-3xl bg-cover bg-center border-4 border-[#8DAA7B]/30 shadow-inner"
-              style={item.image ? { backgroundImage: `url(${item.image})` } : { backgroundColor: '#E8ECE4' }}
+              className="w-36 h-36 sm:w-48 sm:h-48 rounded-3xl bg-cover bg-center border-4 border-[#8DAA7B]/30 shadow-inner shrink-0"
+              style={
+                item.image
+                  ? { backgroundImage: `url(${item.image})` }
+                  : { backgroundColor: "#E8ECE4" }
+              }
             />
 
-            <p className="text-2xl font-black text-[#2D332D]">{item.name}</p>
+            <p className="text-xl sm:text-2xl font-black text-[#2D332D]">{item.name}</p>
+            <p className="text-[10px] text-[#8DAA7B] font-bold uppercase tracking-wide">
+              {question.title}
+            </p>
 
             <button
               onClick={speakItemName}
@@ -810,7 +1096,7 @@ function FindAndCaptureModal({
 
             <button
               onClick={handleBeginSearch}
-              className="w-full flex items-center justify-center gap-2 text-lg bg-[#8DAA7B] text-white px-5 py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+              className="w-full flex items-center justify-center gap-2 text-base sm:text-lg bg-[#8DAA7B] text-white px-5 py-3.5 sm:py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
             >
               <PlayCircle size={22} /> Ayo, Mulai!
             </button>
@@ -818,23 +1104,28 @@ function FindAndCaptureModal({
         )}
 
         {/* ===== Layar: menyiapkan (start soal / buka kamera) ===== */}
-        {stage === 'preparing' && (
-          <div className="p-10 flex flex-col items-center text-center gap-3">
+        {stage === "preparing" && (
+          <div className="p-10 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-3">
             <Loader2 size={36} className="animate-spin text-[#8DAA7B]" />
-            <p className="text-base font-black text-[#2D332D]">Tunggu sebentar ya...</p>
+            <p className="text-base font-black text-[#2D332D]">
+              Tunggu sebentar ya...
+            </p>
             <p className="text-xs text-[#6B705C]">Kamera sedang disiapkan.</p>
           </div>
         )}
 
         {/* ===== Layar: kamera gagal dibuka / izin ditolak ===== */}
-        {stage === 'camera-error' && (
-          <div className="p-6 flex flex-col items-center text-center gap-4">
+        {stage === "camera-error" && (
+          <div className="p-5 sm:p-6 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-4">
             <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center">
               <AlertTriangle size={30} className="text-amber-500" />
             </div>
-            <p className="text-lg font-black text-[#2D332D]">Kamera Belum Bisa Dibuka</p>
+            <p className="text-lg font-black text-[#2D332D]">
+              Kamera Belum Bisa Dibuka
+            </p>
             <p className="text-sm text-[#6B705C] leading-relaxed">
-              Tolong minta bantuan guru atau orang tua untuk mengizinkan kamera di browser ya.
+              Tolong minta bantuan guru atau orang tua untuk mengizinkan kamera
+              di browser ya.
             </p>
             <button
               onClick={handleBeginSearch}
@@ -846,8 +1137,8 @@ function FindAndCaptureModal({
         )}
 
         {/* ===== Layar: overlay kamera fullscreen dalam modal ===== */}
-        {stage === 'camera' && (
-          <div className="relative bg-black flex-1 min-h-[70vh] flex items-center justify-center overflow-hidden">
+        {stage === "camera" && (
+          <div className="relative bg-black flex-1 min-h-[60vh] sm:min-h-[70vh] flex items-center justify-center overflow-hidden">
             <video
               ref={videoRef}
               autoPlay
@@ -856,13 +1147,16 @@ function FindAndCaptureModal({
               className="absolute inset-0 w-full h-full object-cover"
             />
 
-            {/* Pengingat barang target, mengambang di atas kamera */}
             <div className="absolute top-3 left-3 right-3 flex items-center gap-2 bg-black/50 backdrop-blur-sm rounded-2xl px-3 py-2">
               <div
                 className="w-9 h-9 rounded-lg bg-cover bg-center border border-white/40 shrink-0"
-                style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
+                style={
+                  item.image ? { backgroundImage: `url(${item.image})` } : {}
+                }
               />
-              <p className="text-white text-sm font-black truncate">Carilah: {item.name}</p>
+              <p className="text-white text-xs sm:text-sm font-black truncate">
+                Carilah: {item.name} ({position}/{total})
+              </p>
               <button
                 onClick={speakItemName}
                 aria-label="Dengarkan nama barang"
@@ -873,34 +1167,37 @@ function FindAndCaptureModal({
             </div>
 
             <button
-              onClick={handleCloseModal}
-              aria-label="Tutup kamera"
+              onClick={handleExitRun}
+              aria-label="Keluar dari mode berjalan"
               className="absolute top-3 right-3 bg-white/90 hover:bg-white text-[#2D332D] rounded-full p-2 shadow-md ml-2"
-              style={{ marginTop: '3.25rem' }}
+              style={{ marginTop: "3.25rem" }}
             >
               <X size={18} />
             </button>
 
-            {/* Tombol jepret besar di bawah, seperti aplikasi kamera pada umumnya */}
             <div className="absolute bottom-6 left-0 right-0 flex flex-col items-center gap-2">
               <button
                 onClick={handleTakePhoto}
                 aria-label="Ambil foto"
-                className="w-20 h-20 rounded-full bg-white border-4 border-[#8DAA7B] shadow-xl active:scale-95 flex items-center justify-center"
+                className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-white border-4 border-[#8DAA7B] shadow-xl active:scale-95 flex items-center justify-center"
               >
-                <Camera size={30} className="text-[#8DAA7B]" />
+                <Camera size={26} className="sm:w-[30px] sm:h-[30px] text-[#8DAA7B]" />
               </button>
-              <p className="text-white text-xs font-black bg-black/40 rounded-full px-3 py-1">Tekan untuk Foto</p>
+              <p className="text-white text-xs font-black bg-black/40 rounded-full px-3 py-1">
+                Tekan untuk Foto
+              </p>
             </div>
           </div>
         )}
 
         {/* ===== Layar: hasil foto, pilih kirim atau ulangi ===== */}
-        {stage === 'captured' && capturedPreviewUrl && (
-          <div className="p-5 flex flex-col items-center text-center gap-3">
-            <p className="text-base font-black text-[#2D332D]">Foto Sudah Bagus?</p>
+        {stage === "captured" && capturedPreviewUrl && (
+          <div className="p-4 sm:p-5 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-3 overflow-y-auto">
+            <p className="text-base font-black text-[#2D332D]">
+              Foto Sudah Bagus?
+            </p>
             <div
-              className="w-full aspect-square rounded-2xl bg-cover bg-center border-2 border-[#DDE2D8]"
+              className="w-full max-w-xs sm:max-w-none aspect-square rounded-2xl bg-cover bg-center border-2 border-[#DDE2D8]"
               style={{ backgroundImage: `url(${capturedPreviewUrl})` }}
             />
 
@@ -928,43 +1225,67 @@ function FindAndCaptureModal({
         )}
 
         {/* ===== Layar: mengirim jawaban ===== */}
-        {stage === 'submitting' && (
-          <div className="p-10 flex flex-col items-center text-center gap-3">
+        {stage === "submitting" && (
+          <div className="p-10 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-3">
             <Loader2 size={36} className="animate-spin text-[#8DAA7B]" />
-            <p className="text-base font-black text-[#2D332D]">Sedang Mengirim...</p>
+            <p className="text-base font-black text-[#2D332D]">
+              Sedang Mengirim...
+            </p>
             <p className="text-xs text-[#6B705C]">Sabar sebentar ya.</p>
           </div>
         )}
 
         {/* ===== Layar: hasil jawaban ===== */}
-        {stage === 'result' && result && (
-          <div className="p-6 flex flex-col items-center text-center gap-4">
+        {stage === "result" && result && (
+          <div className="p-5 sm:p-6 pt-14 flex-1 sm:flex-initial flex flex-col items-center justify-center text-center gap-4 overflow-y-auto">
             {result.isCorrect ? (
               <>
-                <div className="w-20 h-20 rounded-full bg-emerald-100 flex items-center justify-center">
-                  <CheckCircle2 size={44} className="text-emerald-500" />
+                <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-emerald-100 flex items-center justify-center">
+                  <CheckCircle2 size={38} className="sm:w-11 sm:h-11 text-emerald-500" />
                 </div>
-                <p className="text-2xl font-black text-emerald-600">Hebat, Benar!</p>
-                <p className="text-sm text-[#6B705C]">Kamu berhasil menemukan {item.name}. Skor kamu: {result.score}.</p>
-                <button
-                  onClick={handleCloseModal}
-                  className="w-full flex items-center justify-center gap-2 text-lg bg-emerald-500 text-white px-5 py-4 rounded-2xl font-black active:bg-emerald-600 shadow-lg"
-                >
-                  <CheckCircle2 size={20} /> Selesai
-                </button>
+                <p className="text-xl sm:text-2xl font-black text-emerald-600">
+                  Hebat, Benar!
+                </p>
+                <p className="text-sm text-[#6B705C]">
+                  Kamu berhasil menemukan {item.name}. Skor kamu: {result.score}
+                  .
+                </p>
+                {position < total ? (
+                  <>
+                    <p className="text-xs text-[#8DAA7B] font-bold">
+                      Lanjut otomatis ke soal berikutnya...
+                    </p>
+                    <button
+                      onClick={handleAdvanceNow}
+                      className="w-full flex items-center justify-center gap-2 text-base sm:text-lg bg-emerald-500 text-white px-5 py-3.5 sm:py-4 rounded-2xl font-black active:bg-emerald-600 shadow-lg"
+                    >
+                      <SkipForward size={20} /> Lanjut Sekarang
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={handleAdvanceNow}
+                    className="w-full flex items-center justify-center gap-2 text-base sm:text-lg bg-emerald-500 text-white px-5 py-3.5 sm:py-4 rounded-2xl font-black active:bg-emerald-600 shadow-lg"
+                  >
+                    <Trophy size={20} /> Selesaikan Level
+                  </button>
+                )}
               </>
             ) : (
               <>
-                <div className="w-20 h-20 rounded-full bg-amber-100 flex items-center justify-center">
-                  <XCircle size={44} className="text-amber-500" />
+                <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-amber-100 flex items-center justify-center">
+                  <XCircle size={38} className="sm:w-11 sm:h-11 text-amber-500" />
                 </div>
-                <p className="text-2xl font-black text-amber-600">Belum Tepat</p>
+                <p className="text-xl sm:text-2xl font-black text-amber-600">
+                  Belum Tepat
+                </p>
                 <p className="text-sm text-[#6B705C]">
-                  Sepertinya itu bukan {item.name}. Tidak apa-apa, coba foto lagi ya, kamu pasti bisa!
+                  Sepertinya itu bukan {item.name}. Tidak apa-apa, coba foto
+                  lagi ya, kamu pasti bisa!
                 </p>
                 <button
                   onClick={handleTryAgainAfterWrong}
-                  className="w-full flex items-center justify-center gap-2 text-lg bg-[#8DAA7B] text-white px-5 py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
+                  className="w-full flex items-center justify-center gap-2 text-base sm:text-lg bg-[#8DAA7B] text-white px-5 py-3.5 sm:py-4 rounded-2xl font-black active:bg-[#6f8a63] shadow-lg"
                 >
                   <RotateCcw size={20} /> Coba Lagi
                 </button>
@@ -977,11 +1298,58 @@ function FindAndCaptureModal({
   );
 }
 
+// ==== Layar penutup: muncul saat semua barang di antrian mode jalan otomatis selesai ====
+function LevelRunFinishedModal({
+  totalCompleted,
+  onClose,
+}: {
+  totalCompleted: number;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(
+        "Hebat! Semua soal di level ini sudah selesai.",
+      );
+      utterance.lang = "id-ID";
+      utterance.rate = 0.9;
+      window.speechSynthesis.speak(utterance);
+    }
+
+    return () => {
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3">
+      <div className="bg-[#FDFBF7] w-full max-w-md rounded-3xl p-5 sm:p-6 flex flex-col items-center text-center gap-4 shadow-2xl">
+        <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-emerald-100 flex items-center justify-center">
+          <Trophy size={38} className="sm:w-11 sm:h-11 text-emerald-500" />
+        </div>
+        <p className="text-xl sm:text-2xl font-black text-emerald-600">
+          Hebat, Level Selesai!
+        </p>
+        <p className="text-sm text-[#6B705C]">
+          Kamu sudah menyelesaikan {totalCompleted} soal di level ini.
+        </p>
+        <button
+          onClick={onClose}
+          className="w-full flex items-center justify-center gap-2 text-base sm:text-lg bg-emerald-500 text-white px-5 py-3.5 sm:py-4 rounded-2xl font-black active:bg-emerald-600 shadow-lg"
+        >
+          <CheckCircle2 size={20} /> Selesai
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // Komponen kecil
 function MiniStat({ label, value }: { label: string; value: number }) {
   return (
     <div className="bg-[#F9FBF7] border border-[#E8EEE2] rounded-lg p-1.5">
-      <p className="text-[9px] text-[#6B705C] font-black">{label}</p>
+      <p className="text-[8px] sm:text-[9px] text-[#6B705C] font-black leading-tight">{label}</p>
       <p className="text-sm font-black text-[#2D332D]">{value}</p>
     </div>
   );
@@ -989,14 +1357,16 @@ function MiniStat({ label, value }: { label: string; value: number }) {
 
 function StatusBadge({ status }: { status: string }) {
   const config: Record<string, { bg: string; text: string }> = {
-    COMPLETED: { bg: 'bg-emerald-500', text: 'Selesai' },
-    IN_PROGRESS: { bg: 'bg-amber-500', text: 'Progress' },
-    NOT_STARTED: { bg: 'bg-slate-400', text: 'Belum' },
+    COMPLETED: { bg: "bg-emerald-500", text: "Selesai" },
+    IN_PROGRESS: { bg: "bg-amber-500", text: "Progress" },
+    NOT_STARTED: { bg: "bg-slate-400", text: "Belum" },
   };
   const c = config[status] ?? config.NOT_STARTED;
 
   return (
-    <span className={`${c.bg} text-white px-2.5 py-0.5 rounded-full text-[9px] font-black tracking-wider`}>
+    <span
+      className={`${c.bg} text-white px-2.5 py-0.5 rounded-full text-[9px] font-black tracking-wider whitespace-nowrap`}
+    >
       {c.text}
     </span>
   );

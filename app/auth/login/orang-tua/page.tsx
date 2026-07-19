@@ -19,7 +19,7 @@ export default function LoginOrangTuaPage() {
     }
 
     console.log("Login Orang Tua:", { name, password });
-    // router.push('/dashboard-orangtua');
+    router.push('/orang-tua/dashboard');
   };
 
   return (
