@@ -17,6 +17,7 @@ import {
   Search,
   AlertTriangle,
   Send,
+  Volume2,
 } from 'lucide-react';
 
 interface StudentAnswer {
@@ -595,6 +596,7 @@ function ItemRow({
 // - teks pendek, kalimat sederhana
 // - tombol besar dengan ikon + tulisan (bukan ikon saja)
 // - warna & ikon dipakai bersamaan sebagai penanda benar/salah
+// - nama barang juga dibacakan otomatis lewat text-to-speech (Web Speech API)
 // ============================================================
 
 type ModalStage = 'intro' | 'preparing' | 'camera' | 'camera-error' | 'captured' | 'submitting' | 'result';
@@ -620,14 +622,33 @@ function FindAndCaptureModal({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // Selalu matikan kamera saat modal ditutup / komponen dilepas
+  // === Text-to-speech: ucapkan nama barang yang harus dicari ===
+  const speakItemName = () => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel(); // hentikan suara sebelumnya kalau masih ngomong
+    const utterance = new SpeechSynthesisUtterance(`Carilah benda ini, ${item.name}`);
+    utterance.lang = 'id-ID';
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+  };
+
+  // Selalu matikan kamera & suara saat modal ditutup / komponen dilepas
   useEffect(() => {
     return () => {
       stopCamera();
       if (capturedPreviewUrl) URL.revokeObjectURL(capturedPreviewUrl);
+      window.speechSynthesis?.cancel();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Otomatis ucapkan nama barang setiap kali layar intro tampil
+  useEffect(() => {
+    if (stage === 'intro') {
+      speakItemName();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage]);
 
   const stopCamera = () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -734,6 +755,7 @@ function FindAndCaptureModal({
 
   const handleCloseModal = () => {
     stopCamera();
+    window.speechSynthesis?.cancel();
     onClose();
   };
 
@@ -765,6 +787,15 @@ function FindAndCaptureModal({
             />
 
             <p className="text-2xl font-black text-[#2D332D]">{item.name}</p>
+
+            <button
+              onClick={speakItemName}
+              aria-label="Dengarkan nama barang"
+              className="flex items-center gap-1.5 text-xs bg-[#8DAA7B]/10 text-[#6f8a63] px-3 py-1.5 rounded-full font-bold active:bg-[#8DAA7B]/20"
+            >
+              <Volume2 size={14} /> Dengar Lagi
+            </button>
+
             <p className="text-sm text-[#6B705C] leading-relaxed">
               Carilah barang ini di sekitarmu.
               <br />
@@ -832,6 +863,13 @@ function FindAndCaptureModal({
                 style={item.image ? { backgroundImage: `url(${item.image})` } : {}}
               />
               <p className="text-white text-sm font-black truncate">Carilah: {item.name}</p>
+              <button
+                onClick={speakItemName}
+                aria-label="Dengarkan nama barang"
+                className="ml-auto shrink-0 bg-white/20 hover:bg-white/30 text-white rounded-full p-1.5"
+              >
+                <Volume2 size={14} />
+              </button>
             </div>
 
             <button
